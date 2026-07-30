@@ -1,10 +1,18 @@
 # AlcoLock
 
-A breathalyzer-gated screen lock for Windows/Linux. An MQ-3 alcohol sensor
-connected to an Arduino-compatible board feeds live readings over serial to a
-PowerShell script, which locks the workstation whenever the reading exceeds a
-configured threshold — and only unlocks it after a genuine, fresh, sober
-breath is measured.
+A breathalyzer-gated screen lock. An MQ-3 alcohol sensor connected to an
+Arduino-compatible board feeds live readings over serial to a host-side
+script, which locks the session whenever the reading exceeds a configured
+threshold — and only unlocks it after a genuine, fresh, sober breath is
+measured.
+
+Two equivalent implementations are provided:
+
+- **`alco_lock.ps1`** — PowerShell, for Windows (primary deployment target).
+- **`alco_lock.py`** — Python, for Linux (see [Linux (Python) version](#linux-python-version)).
+
+Both share the identical sensor-verification logic; only the OS-integration
+pieces (screen lock, password prompt, autostart) differ.
 
 > Personal self-discipline tool. Not a certified breathalyzer, not a legal
 > sobriety test, and not a substitute for one.
@@ -171,6 +179,64 @@ and ambient conditions — expect to tune them after a few real test runs.
   with native USB HID (Leonardo, Micro, Pro Micro, Due, ESP32-S3, RP2040,
   etc.) and its own tradeoffs (antivirus/EDR may flag keystroke-injection
   capable USB devices).
+
+## Linux (Python) version
+
+`alco_lock.py` is a native Linux port with the same detection logic (identical
+calibration, re-arm, and impulse-detection stages — including the fix for the
+false-unlock-from-residual-vapor bug described above). System integration is
+adapted to Linux equivalents instead of Windows APIs:
+
+| Windows (`alco_lock.ps1`)        | Linux (`alco_lock.py`)                          |
+|-----------------------------------|--------------------------------------------------|
+| `rundll32 user32.dll,LockWorkStation` | `loginctl lock-session` (falls back to `xdg-screensaver`, `dm-tool`, `gnome-screensaver-command`, `cinnamon-screensaver-command`, or `xscreensaver-command` — whichever is available) |
+| GUI password dialog (WinForms)   | Console prompt via `getpass`                      |
+| Task Scheduler (`Normal`: hourly trigger, `Quiet`: at logon) | `systemd --user` timer (`alcolock.timer`, hourly) for `Normal`; `systemd --user` service (`alcolock.service`, `WantedBy=default.target`) for `Quiet` |
+| `C:\ProgramData\AlcoLock`        | `~/.local/share/alcolock`                         |
+
+### Requirements
+
+- Python 3.8+
+- [pyserial](https://pypi.org/project/pyserial/):
+  ```bash
+  pip install pyserial --break-system-packages
+  ```
+
+### Usage
+
+```
+alco_lock.py [--mode Normal|Quiet] [--debug] [--port <device>] [--cleanup]
+```
+
+Run `alco_lock.py --help` for the full list of options and examples.
+
+```bash
+# Normal use: background monitoring, real locking, autodetected port
+python3 alco_lock.py --mode Quiet
+
+# Safe dry run: watch sensor + fake lock/unlock logs, no real locking
+python3 alco_lock.py --mode Quiet --debug
+
+# Force a specific device when multiple serial adapters are connected
+python3 alco_lock.py --mode Quiet --port /dev/ttyACM0
+
+# Uninstall (removes the systemd unit(s) and installed files)
+python3 alco_lock.py --cleanup
+```
+
+### Notes specific to the Linux version
+
+- **Screen-lock command availability varies by desktop environment.** The
+  script tries several common ones in order and logs a warning if none are
+  found — check that at least one of them works on your system before
+  relying on this for real (test with `--debug` off in a throwaway session
+  first, or just run the lock command by hand to confirm it works).
+- **Port autodetection** matches the same `Arduino`/`CH340`/`CH341`/
+  `CP210x`/`FTDI`/`USB-SERIAL` description patterns as the Windows version,
+  falling back to `/dev/ttyACM*` then `/dev/ttyUSB*` by device node.
+- Self-install (`install_self`) writes to `~/.config/systemd/user/`, which
+  requires a user systemd instance (the default on virtually all modern
+  distros with systemd; not applicable on non-systemd init systems).
 
 ## Uninstalling
 
