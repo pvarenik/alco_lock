@@ -179,10 +179,10 @@ function Find-SerialPort {
             $devices = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop |
                 Where-Object { $_.Name -match '\(COM\d+\)' }
 
-            $known = $devices | Where-Object {
+            $known = @($devices | Where-Object {
                 $_.Name -match 'Arduino' -or $_.Name -match 'CH340' -or $_.Name -match 'CH341' -or
                 $_.Name -match 'USB-SERIAL' -or $_.Name -match 'CP210' -or $_.Name -match 'FTDI'
-            }
+            })
 
             if ($known.Count -gt 1) {
                 Write-Log "Multiple matching devices found, using the first one. If it's wrong, set the port manually (-Port):" "Yellow"
@@ -198,7 +198,7 @@ function Find-SerialPort {
         }
 
         # 2) Fallback: no exact match found - take the first available COM port
-        $ports = [System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object
+        $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
         if ($ports.Count -gt 1) {
             Write-Log "Multiple COM ports available ($($ports -join ', ')), using the first: $($ports[0]). If it's wrong, set -Port manually." "Yellow"
         }

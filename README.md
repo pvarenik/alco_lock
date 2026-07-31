@@ -238,6 +238,89 @@ python3 alco_lock.py --cleanup
   requires a user systemd instance (the default on virtually all modern
   distros with systemd; not applicable on non-systemd init systems).
 
+## Notifications and visibility
+
+Both implementations now actively tell you what's happening instead of
+silently locking and unlocking:
+
+- **Desktop notifications** at every meaningful transition: why you were
+  locked, live sensor readings while waiting for the chamber to clear,
+  breath-test progress (`X/5 sec`), and the final success/failure/interrupted
+  outcome. Windows uses a system tray balloon tip (`NotifyIcon`, no extra
+  install needed); Linux uses `notify-send` if available.
+- **Real lock-state detection**, instead of blindly re-issuing the lock
+  command on every 0.5s poll: Windows checks whether `logonui.exe` (the
+  process that draws the lock screen) is running; Linux checks
+  `loginctl show-session $XDG_SESSION_ID -p LockedHint`. The script only
+  re-locks (and re-notifies) when it detects you've actually gotten back to
+  an unlocked desktop — which also happens to be the only moment a
+  notification can render at all.
+- **A persistent log file** (`alcolock.log` in the install directory) mirrors
+  everything printed to the console, so the full process is reviewable
+  afterward even when running invisibly in `Quiet` mode (as a hidden
+  scheduled task / systemd service with no visible window).
+
+### Why you can't see anything *during* the actual lock screen
+
+This is an intentional OS security boundary, not a gap in the script: Windows
+renders its lock screen on a separate **Secure Desktop**, and Linux screen
+lockers run as their own isolated surface — neither lets an ordinary
+process draw custom UI on top of them. So notifications only appear in the
+brief window when you're genuinely back at your desktop (right before the
+script re-locks it), not while the lock screen itself is showing. That
+window is exactly when the "why am I locked again?" explanation is most
+useful anyway.
+
+### Linux-specific caveat: no locker daemon = no real lock
+
+`loginctl lock-session` only sends a signal to systemd-logind saying "mark
+this session as locked" — it does **not** draw a password screen by itself.
+An actual lock screen only appears if a locker daemon (`light-locker`,
+`gnome-screensaver`, `xscreensaver`, `i3lock` + a wrapper, etc.) is running
+and subscribed to that signal. If none is installed/running, the session is
+marked "locked" internally but nothing visually changes and there's no
+password prompt to bypass — which is very likely what you're seeing if the
+script appears to loop without ever asking for a password. Install and
+enable one of the above for your desktop environment if you want a real,
+enforced lock.
+
+## GUI lock overlay (Linux)
+
+Since Linux has no guaranteed equivalent of Windows' Secure Desktop lock
+screen (see the locker-daemon caveat above), `alco_lock.py` enforces the
+lock itself with its own always-on-top window, built with `tkinter`. This
+window **is** the barrier - it opens whenever the threshold is exceeded, and
+the only ways out are:
+
+1. A genuine sober breath (the same re-arm + impulse-detection logic
+   described above, running live and updating the window as it happens), or
+2. Typing the master password into the field at the bottom of the window.
+
+The window disables its own close button, stays topmost and fullscreen, and
+also fires a best-effort real OS-level lock (`loginctl lock-session` etc.)
+underneath as defense in depth, in case a locker daemon *is* present.
+
+Requirements: `python3-tk` (usually a separate OS package from `python3`
+itself):
+```bash
+sudo apt install python3-tk        # Debian/Ubuntu
+sudo dnf install python3-tkinter   # Fedora
+sudo pacman -S tk                  # Arch
+```
+If it's missing, the script falls back to console-only enforcement (same
+behavior as before) rather than crashing.
+
+### GUI + systemd caveat
+
+A `systemd --user` service doesn't automatically inherit your graphical
+session's `DISPLAY`/`XAUTHORITY`, which `tkinter` needs to open a window.
+`install_self` captures these from the environment at install time and
+bakes them into the generated `alcolock.service` unit, so run the install
+step from your actual desktop session (not over a plain SSH connection
+without X forwarding) for the GUI to work once installed. If the window
+still doesn't appear after installing, check `alcolock.log` for a
+`DISPLAY/XAUTHORITY` warning and re-run the install from your desktop.
+
 ## Uninstalling
 
 ```powershell
