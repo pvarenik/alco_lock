@@ -689,6 +689,7 @@ function Initialize-Baseline {
     }
 
     $baselineVal = 80 # Default fallback
+    $lastRawVal = $baselineVal
 
     if ($samples.Count -gt 0) {
         # Take the second half of the samples (once the sensor has stabilized)
@@ -698,75 +699,104 @@ function Initialize-Baseline {
         $sum = 0
         foreach ($s in $stableSamples) { $sum += $s }
         $baselineVal = [math]::Round($sum / $stableSamples.Count)
+        $lastRawVal = $samples[$samples.Count - 1]
     }
 
     Write-Log "Calibration complete! Clean air baseline value: $baselineVal" "Green"
-    return $baselineVal
+    return [PSCustomObject]@{ Baseline = $baselineVal; LastReading = $lastRawVal }
+}
+
+# --- SENSOR CONNECTION (never throws - returns $null on failure so the
+#     caller can route to the blocking overlay instead of silently exiting).
+#     Used both for the initial connection and every reconnect, so that
+#     turning the device off/unplugging it can never be used to cancel
+#     verification - a missing sensor always demands the master password
+#     or a real reconnect, the same as a mid-session disconnect does. ---
+function Connect-Sensor {
+    param([string]$override = "")
+    try {
+        $portName = Resolve-SerialPort -override $override
+        $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, None, 8, One
+        $port.Open()
+        Write-Log "Using port: $portName" "Green"
+        return $port
+    } catch {
+        Write-Log "Could not connect to the sensor: $_" "Red"
+        return $null
+    }
 }
 
 # --- MAIN OPERATING LOOP ---
 Write-Log "Starting AlcoLock. Mode: $Mode." "Green"
 if ($Debug) { Write-Log "DEBUG MODE ACTIVE" "Yellow" }
 
-$portName = Resolve-SerialPort -override $Port
-Write-Log "Using port: $portName" "Green"
+$serialPort = Connect-Sensor -override $Port
 
-$serialPort = New-Object System.IO.Ports.SerialPort $portName, $baudRate, None, 8, One
+if (-not $serialPort) {
+    Show-WaitingOverlay -message "Sensor not found. Connect the device to continue, or enter the master password." -checkAction {
+        $script:serialPort = Connect-Sensor -override $Port
+        return [bool]$script:serialPort
+    }.GetNewClosure() -checkIntervalMs 2000
+}
 
-try {
-    $serialPort.Open()
+if ($serialPort) {
+    try {
+        # Warmup and clean-air measurement is performed ONCE at script startup
+        $calibration = Initialize-Baseline -serialPort $serialPort
+        $globalBaseline = $calibration.Baseline
 
-    # Warmup and clean-air measurement is performed ONCE at script startup
-    $globalBaseline = Initialize-Baseline -serialPort $serialPort
+        if ($Mode -eq "Normal") {
+            # ================= NORMAL MODE =================
+            # Intentionally unconditional: this is a periodic sobriety check-in
+            # (e.g. hourly via Task Scheduler), not a reaction to a detected
+            # spike - the whole point is to make sure the person at the
+            # computer stays sober, checked at regular intervals.
+            Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
+            Write-Log "Check complete. Script will exit until next hour." "Cyan"
 
-    if ($Mode -eq "Normal") {
-        # ================= NORMAL MODE =================
-        Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
-        Write-Log "Authentication session complete. Script will exit until next hour." "Cyan"
+        } else {
+            # ================= QUIET MODE =================
+            while ($serialPort.IsOpen) {
+                try {
+                    $line = $serialPort.ReadLine().Trim()
+                    if ($line -match '^\d+$') {
+                        [int]$val = $line
+                        Write-Log "Background monitoring: $val" "White"
 
-    } else {
-        # ================= QUIET MODE =================
-        while ($serialPort.IsOpen) {
-            try {
-                $line = $serialPort.ReadLine().Trim()
-                if ($line -match '^\d+$') {
-                    [int]$val = $line
-                    Write-Log "Background monitoring: $val" "White"
-
-                    if ($val -gt $threshold) {
-                        Write-Log "THRESHOLD EXCEEDED! ($val > $threshold)" "Red"
-                        # Reuse the already-known $globalBaseline, without another 10-sec warmup
-                        Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
+                        if ($val -gt $threshold) {
+                            Write-Log "THRESHOLD EXCEEDED! ($val > $threshold)" "Red"
+                            # Reuse the already-known $globalBaseline, without another 10-sec warmup
+                            Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
+                        }
                     }
                 }
-            }
-            catch {
-                Write-Log "WARNING: SENSOR DISCONNECTED OR COM PORT CONNECTION LOST!" "Red"
+                catch {
+                    Write-Log "WARNING: SENSOR DISCONNECTED OR COM PORT CONNECTION LOST!" "Red"
 
-                Show-WaitingOverlay -message "Sensor disconnected. Reconnect the device to unlock, or enter the master password." -checkAction {
-                    try { $serialPort.Open() } catch {}
-                    return $serialPort.IsOpen
-                } -checkIntervalMs 1000
+                    Show-WaitingOverlay -message "Sensor disconnected. Reconnect the device to unlock, or enter the master password." -checkAction {
+                        $script:serialPort = Connect-Sensor -override $Port
+                        return [bool]$script:serialPort
+                    }.GetNewClosure() -checkIntervalMs 1000
 
-                if ($serialPort.IsOpen) {
-                    # Recalibrate clean air on reconnect
-                    $globalBaseline = Initialize-Baseline -serialPort $serialPort
-                    Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
+                    if ($serialPort -and $serialPort.IsOpen) {
+                        # Recalibrate clean air on reconnect
+                        $calibration = Initialize-Baseline -serialPort $serialPort
+                        $globalBaseline = $calibration.Baseline
+                        if ($calibration.LastReading -gt $threshold) {
+                            Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
+                        } else {
+                            Write-Log "Sensor reconnected, reading is sober ($($calibration.LastReading) <= $threshold) - resuming background monitoring." "Green"
+                        }
+                    }
                 }
-            }
 
-            Start-Sleep -Seconds 2
+                Start-Sleep -Seconds 2
+            }
         }
     }
-}
-catch {
-    Write-Log "Error opening COM port: $_" "Red"
-    if ($Mode -eq "Quiet") {
-        Show-WaitingOverlay -message "Could not open the sensor's serial port. Reconnect the device to unlock, or enter the master password." -checkAction {
-            try { $serialPort.Open(); return $serialPort.IsOpen } catch { return $false }
-        } -checkIntervalMs 2000
+    finally {
+        if ($serialPort.IsOpen) { $serialPort.Close() }
     }
-}
-finally {
-    if ($serialPort.IsOpen) { $serialPort.Close() }
+} else {
+    Write-Log "No sensor connection available (master password was used to bypass) - exiting." "Yellow"
 }

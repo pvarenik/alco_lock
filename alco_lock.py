@@ -332,15 +332,17 @@ def initialize_baseline(ser):
         time.sleep(0.5)
 
     baseline_val = 80  # Default fallback
+    last_raw_val = baseline_val
 
     if samples:
         # Take the second half of the samples (once the sensor has stabilized)
         half_index = len(samples) // 2
         stable_samples = samples[half_index:]
         baseline_val = round(sum(stable_samples) / len(stable_samples))
+        last_raw_val = samples[-1]
 
     log(f"Calibration complete! Clean air baseline value: {baseline_val}", "Green")
-    return baseline_val
+    return baseline_val, last_raw_val
 
 
 # --- SHARED BREATH-TEST AND VALIDATION LOGIC ---
@@ -740,40 +742,53 @@ def main():
     if args.debug:
         log("DEBUG MODE ACTIVE", "Yellow")
 
-    port_name = resolve_serial_port(args.port)
-    log(f"Using port: {port_name}", "Green")
+    def connect_sensor(port_override):
+        # Never raises - returns None on failure so the caller can route to
+        # the blocking overlay instead of crashing silently. Used both for
+        # the initial connection and every reconnect, so that turning the
+        # device off/unplugging it can never be used to cancel verification -
+        # a missing sensor always demands the master password or a real
+        # reconnect, the same as a mid-session disconnect does.
+        try:
+            port_name = resolve_serial_port(port_override)
+            new_ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
+            log(f"Using port: {port_name}", "Green")
+            return new_ser
+        except Exception as e:
+            log(f"Could not connect to the sensor: {e}", "Red")
+            return None
 
-    ser = None
-    try:
-        ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
-    except Exception as e:
-        log(f"Error opening serial port: {e}", "Red")
-        if CURRENT_MODE == "Quiet":
-            def try_open():
-                nonlocal ser
-                try:
-                    ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
-                    return True
-                except Exception:
-                    return False
-            run_waiting_overlay(
-                "Could not open the sensor's serial port.\nReconnect the device, "
-                "or enter the master password to override.",
-                check_ready=try_open, check_interval_sec=2, debug=args.debug,
-            )
-        if ser is None:
-            # Either not in Quiet mode, or the person used the master-password
-            # override without ever reconnecting the sensor - nothing left to do.
-            log("No working sensor connection - exiting.", "Yellow")
-            sys.exit(1)
+    ser = connect_sensor(args.port)
+
+    if ser is None:
+        def try_connect():
+            nonlocal ser
+            ser = connect_sensor(args.port)
+            return ser is not None
+
+        run_waiting_overlay(
+            "Sensor not found.\nConnect the device to continue, "
+            "or enter the master password to override.",
+            check_ready=try_connect, check_interval_sec=2, debug=args.debug,
+        )
+
+    if ser is None:
+        # The master password was used to bypass without ever connecting a
+        # sensor - nothing left to monitor.
+        log("No sensor connection available (master password was used to bypass) - exiting.", "Yellow")
+        sys.exit(0)
 
     try:
-        global_baseline = initialize_baseline(ser)
+        global_baseline, last_reading = initialize_baseline(ser)
 
         if CURRENT_MODE == "Normal":
             # ================= NORMAL MODE =================
+            # Intentionally unconditional: this is a periodic sobriety
+            # check-in (e.g. hourly via a systemd timer), not a reaction to
+            # a detected spike - the whole point is to make sure the person
+            # at the computer stays sober, checked at regular intervals.
             run_lock_overlay(ser, global_baseline, args.debug)
-            log("Authentication session complete. Script will exit until next run.", "Cyan")
+            log("Check complete. Script will exit until next run.", "Cyan")
 
         else:
             # ================= QUIET MODE =================
@@ -793,11 +808,9 @@ def main():
                     log("WARNING: SENSOR DISCONNECTED OR SERIAL CONNECTION LOST!", "Red")
 
                     def try_reconnect():
-                        try:
-                            ser.open()
-                        except Exception:
-                            pass
-                        return ser.is_open
+                        nonlocal ser
+                        ser = connect_sensor(args.port)
+                        return ser is not None
 
                     run_waiting_overlay(
                         "Sensor disconnected.\nReconnect the device to unlock, "
@@ -805,14 +818,22 @@ def main():
                         check_ready=try_reconnect, check_interval_sec=1, debug=args.debug,
                     )
 
-                    if ser.is_open:
+                    if ser is not None and ser.is_open:
                         # Recalibrate clean air on reconnect
-                        global_baseline = initialize_baseline(ser)
-                        run_lock_overlay(ser, global_baseline, args.debug)
+                        global_baseline, last_reading = initialize_baseline(ser)
+                        if last_reading > THRESHOLD:
+                            run_lock_overlay(ser, global_baseline, args.debug)
+                        else:
+                            log(f"Sensor reconnected, reading is sober ({last_reading} <= {THRESHOLD}) "
+                                f"- resuming background monitoring.", "Green")
+                    else:
+                        # Master password was used to bypass the reconnect wait -
+                        # stop monitoring for this run instead of looping forever.
+                        break
 
                 time.sleep(2)
     finally:
-        if ser.is_open:
+        if ser is not None and ser.is_open:
             ser.close()
 
 
