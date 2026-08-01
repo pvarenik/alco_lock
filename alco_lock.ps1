@@ -1,28 +1,33 @@
 <#
 .SYNOPSIS
-    Breathalyzer-based screen lock. Locks the workstation until a sober breath
-    is confirmed by an MQ-3 alcohol sensor connected via an Arduino-compatible board.
+    Breathalyzer-gated action blocker. Shows a fullscreen, always-on-top
+    overlay until a sober breath is confirmed by an MQ-3 alcohol sensor
+    connected via an Arduino-compatible board.
 
 .DESCRIPTION
-    Reads sensor readings from a serial port (Arduino/MQ-3), calibrates a clean-air
-    baseline on startup, and locks the workstation whenever the reading exceeds the
-    configured threshold. Access is restored only after a genuine fresh breath
-    (detected as a sharp impulse, not just a slowly-clearing residual reading)
-    stays within the sober range for several consecutive seconds.
+    Reads sensor readings from a serial port (Arduino/MQ-3), calibrates a
+    clean-air baseline on startup, and shows a fullscreen blocking window
+    whenever the reading exceeds the configured threshold. This is an
+    app-level overlay (not a real Windows session lock via LockWorkStation) -
+    it stays on top of everything, disables its own close button, and only
+    closes after a genuine fresh breath (detected as a sharp impulse, not
+    just a slowly-clearing residual reading) stays within the sober range
+    for several consecutive seconds, or the master password is entered.
 
     Modes:
-      Normal - locks once immediately, verifies sobriety, then exits (meant to be
-               re-triggered hourly by Task Scheduler).
-      Quiet  - stays running in the background, silently monitoring the sensor,
-               and only locks when the threshold is actually exceeded.
+      Normal - shows the overlay once immediately, verifies sobriety, then
+               exits (meant to be re-triggered hourly by Task Scheduler).
+      Quiet  - stays running in the background, silently monitoring the
+               sensor, and only shows the overlay when the threshold is
+               actually exceeded.
 
 .PARAMETER Mode
     Normal or Quiet. See DESCRIPTION. Default: Normal.
 
 .PARAMETER Debug
-    Alias -d. Dry-run mode: skips autostart installation and does not actually
-    call LockWorkStation or require a real master password - just logs what
-    would have happened. Use this for testing without an installed sensor rig.
+    Alias -d. Skips autostart installation and the password prompt used by
+    -Cleanup. The verification overlay itself still runs normally either way -
+    it's an app window, not a real OS lock, so it's always safe to test.
 
 .PARAMETER Cleanup
     Removes the scheduled task and the installed copy in C:\ProgramData\AlcoLock
@@ -101,8 +106,8 @@ USAGE:
 PARAMETERS:
   -Mode <Normal|Quiet>   Normal: lock once, verify, exit (default).
                          Quiet: run continuously in the background.
-  -Debug (-d)            Dry run - logs actions instead of actually locking
-                         the screen or requiring a real password.
+  -Debug (-d)            Skips autostart install and the -Cleanup password
+                         prompt. The overlay itself always runs normally.
   -Port <name>           Force a specific serial port (e.g. COM5 or
                          /dev/ttyACM0), skipping autodetection.
   -Cleanup               Remove the scheduled task and installed files
@@ -155,13 +160,27 @@ $installDir = "C:\ProgramData\AlcoLock"
 if ($env:OS -eq "Windows_NT") {
     Add-Type -AssemblyName Microsoft.VisualBasic -ErrorAction SilentlyContinue
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 }
 
-# --- DEBUG LOG OUTPUT ---
+# --- DEBUG LOG OUTPUT (console + persistent file, so the process is
+#     reviewable afterward even when running invisibly in Quiet mode) ---
+$script:logFilePath = if ($env:OS -eq "Windows_NT") {
+    Join-Path $installDir "alcolock.log"
+} else {
+    Join-Path (Join-Path $HOME ".local/share/alcolock") "alcolock.log"
+}
+
 function Write-Log {
     param([string]$message, [string]$color = "Gray")
     $timestamp = Get-Date -Format "HH:mm:ss"
     Write-Host "[$timestamp] [$Mode-Mode] $message" -ForegroundColor $color
+
+    try {
+        $logDir = Split-Path $script:logFilePath -Parent
+        if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
+        Add-Content -Path $script:logFilePath -Value "[$timestamp] [$Mode-Mode] $message" -ErrorAction SilentlyContinue
+    } catch {}
 }
 
 # --- SERIAL PORT AUTODETECTION ---
@@ -289,16 +308,285 @@ function Show-PasswordDialog {
     return $null
 }
 
-function Invoke-LockPC {
-    if ($Debug) {
-        Write-Log "[DEBUG] >>> SYSTEM LOCK CALL (LockWorkStation) <<<" "Red"
-    } else {
-        if ($env:OS -eq "Windows_NT") {
-            rundll32.exe user32.dll,LockWorkStation
-        } else {
-            Write-Log "[WARNING] Screen lock is not supported on this OS." "Yellow"
-        }
+# --- FULLSCREEN BLOCKING OVERLAY (replaces LockWorkStation entirely) ---
+# Windows' native lock screen (Secure Desktop) can't display live status, so
+# instead of locking the OS session, this app-level window IS the barrier:
+# always-on-top, borderless, spans all monitors, and disables its own close
+# button. The only ways out are a genuine sober breath or the master password.
+
+function New-OverlayForm {
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "AlcoLock"
+    $form.FormBorderStyle = "None"
+    $form.TopMost = $true
+    $form.BackColor = [System.Drawing.Color]::FromArgb(26, 26, 26)
+    $form.StartPosition = "Manual"
+    $form.Bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $form.ControlBox = $false
+    $form.ShowInTaskbar = $true
+
+    $titleLbl = New-Object System.Windows.Forms.Label
+    $titleLbl.Text = "AlcoLock"
+    $titleLbl.Font = New-Object System.Drawing.Font("Segoe UI", 28, [System.Drawing.FontStyle]::Bold)
+    $titleLbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 85, 85)
+    $titleLbl.AutoSize = $true
+    $titleLbl.Location = New-Object System.Drawing.Point(60, 60)
+    $form.Controls.Add($titleLbl)
+
+    $headlineLbl = New-Object System.Windows.Forms.Label
+    $headlineLbl.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+    $headlineLbl.ForeColor = [System.Drawing.Color]::White
+    $headlineLbl.Size = New-Object System.Drawing.Size(760, 60)
+    $headlineLbl.Location = New-Object System.Drawing.Point(60, 150)
+    $form.Controls.Add($headlineLbl)
+
+    $detailLbl = New-Object System.Windows.Forms.Label
+    $detailLbl.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+    $detailLbl.ForeColor = [System.Drawing.Color]::FromArgb(187, 187, 187)
+    $detailLbl.Size = New-Object System.Drawing.Size(760, 90)
+    $detailLbl.Location = New-Object System.Drawing.Point(60, 220)
+    $form.Controls.Add($detailLbl)
+
+    $pwLabel = New-Object System.Windows.Forms.Label
+    $pwLabel.Text = "Blow into the sensor to unlock, or enter the master password:"
+    $pwLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $pwLabel.ForeColor = [System.Drawing.Color]::FromArgb(204, 204, 204)
+    $pwLabel.AutoSize = $true
+    $pwLabel.Location = New-Object System.Drawing.Point(60, 340)
+    $form.Controls.Add($pwLabel)
+
+    $pwBox = New-Object System.Windows.Forms.TextBox
+    $pwBox.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+    $pwBox.Size = New-Object System.Drawing.Size(250, 30)
+    $pwBox.Location = New-Object System.Drawing.Point(60, 370)
+    $pwBox.UseSystemPasswordChar = $true
+    $form.Controls.Add($pwBox)
+
+    $unlockBtn = New-Object System.Windows.Forms.Button
+    $unlockBtn.Text = "Unlock"
+    $unlockBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $unlockBtn.Size = New-Object System.Drawing.Size(100, 32)
+    $unlockBtn.Location = New-Object System.Drawing.Point(320, 369)
+    $form.Controls.Add($unlockBtn)
+
+    $errorLbl = New-Object System.Windows.Forms.Label
+    $errorLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $errorLbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 85, 85)
+    $errorLbl.AutoSize = $true
+    $errorLbl.Location = New-Object System.Drawing.Point(60, 412)
+    $form.Controls.Add($errorLbl)
+
+    # Fight back a little if the user alt-tabs away - not real security (a
+    # determined user can still kill the process via Task Manager), just
+    # keeps the window from being trivially ignored.
+    $form.Add_Deactivate({
+        $form.TopMost = $false
+        $form.TopMost = $true
+    }.GetNewClosure())
+
+    return [PSCustomObject]@{
+        Form          = $form
+        Headline      = $headlineLbl
+        Detail        = $detailLbl
+        PasswordBox   = $pwBox
+        UnlockButton  = $unlockBtn
+        ErrorLabel    = $errorLbl
     }
+}
+
+function Show-VerificationOverlay {
+    param(
+        [System.IO.Ports.SerialPort]$serialPort,
+        [int]$baselineVal
+    )
+
+    try { $serialPort.DiscardInBuffer() } catch {}
+
+    $rearmThreshold = $baselineVal + 40   # Level the chamber must drop below to be considered clear
+    $minBlowingVal  = $baselineVal + 10   # Minimum level for a clean breath
+    $deltaTrigger   = 15                  # Minimum sharp jump (+15) to detect an impulse
+
+    Write-Log "LOCKED! Waiting for the sensor chamber to clear (value must drop below $rearmThreshold)..." "Red"
+
+    $state = @{
+        Stage                   = "Rearm"   # "Rearm" or "Breath"
+        LastRearmVal            = $baselineVal
+        PrevVal                 = $baselineVal
+        ConsecutiveSoberSeconds = 0
+        IsBlowingStarted        = $false
+        AllowClose              = $false
+    }
+
+    $ui = New-OverlayForm
+    $form = $ui.Form
+    $ui.Headline.Text = "Alcohol detected"
+    $ui.Detail.Text = "Waiting for the sensor to clear before you can retest. Do not blow yet."
+
+    $form.Add_FormClosing({
+        param($s, $e)
+        if (-not $state.AllowClose) { $e.Cancel = $true }
+    }.GetNewClosure())
+
+    $tryUnlock = {
+        if ($ui.PasswordBox.Text -eq $masterPass) {
+            Write-Log "Master password override accepted - closing the overlay." "Yellow"
+            $state.AllowClose = $true
+            $form.Close()
+        } else {
+            $ui.ErrorLabel.Text = "Incorrect password."
+            $ui.PasswordBox.Text = ""
+        }
+    }.GetNewClosure()
+
+    $ui.UnlockButton.Add_Click($tryUnlock)
+    $ui.PasswordBox.Add_KeyDown({
+        param($s, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { & $tryUnlock }
+    }.GetNewClosure())
+
+    $serialPort.ReadTimeout = 400
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 500
+
+    $timer.Add_Tick({
+        try {
+            $line = $serialPort.ReadLine().Trim()
+        } catch {
+            return  # read timeout / no data this tick - fine, just wait for the next one
+        }
+        if ($line -notmatch '^\d+$') { return }
+        [int]$val = $line
+
+        if ($state.Stage -eq "Rearm") {
+            $state.LastRearmVal = $val
+            if ($val -le $rearmThreshold) {
+                Write-Log "Chamber cleared ($val <= $rearmThreshold). System ready for a new breath test!" "Green"
+                Write-Log "Waiting for a sharp breath (impulse +$deltaTrigger over 0.5s, corridor: from $minBlowingVal to $threshold)..." "Yellow"
+                $state.Stage = "Breath"
+                $state.PrevVal = $state.LastRearmVal
+                $ui.Headline.Text = "Ready - blow into the sensor"
+                $ui.Detail.Text = "Needs a sharp jump above $minBlowingVal, then stay below $threshold for $soberTime sec."
+            } else {
+                Write-Log "Clearing chamber: $val (waiting for <= $rearmThreshold)" "DarkGray"
+                $ui.Headline.Text = "Alcohol detected - waiting for the sensor to clear"
+                $ui.Detail.Text = "Current reading: $val  (need <= $rearmThreshold)`nDo not blow yet."
+            }
+            return
+        }
+
+        # Stage = Breath
+        $delta = $val - $state.PrevVal
+
+        if (-not $state.IsBlowingStarted) {
+            if ($delta -ge $deltaTrigger -and $val -ge $minBlowingVal) {
+                $state.IsBlowingStarted = $true
+                Write-Log "Breath IMPULSE detected! (Jump of +$delta, current: $val). Measuring sobriety ($soberTime sec)..." "Yellow"
+                $ui.Headline.Text = "Breath detected - keep going"
+            } else {
+                Write-Log "Waiting for breath... Value: $val (Delta: $delta, need jump >= +$deltaTrigger)" "DarkGray"
+                $ui.Headline.Text = "Ready - blow into the sensor"
+                $ui.Detail.Text = "Current reading: $val  (need a sharp jump above $minBlowingVal)"
+                $state.PrevVal = $val
+                return
+            }
+        }
+
+        Write-Log "Blowing: $val (Corridor: $minBlowingVal - $threshold, Progress: $($state.ConsecutiveSoberSeconds)/$soberTime sec)" "Magenta"
+        $ui.Detail.Text = "Reading: $val  (must stay < $threshold)`nSober for $($state.ConsecutiveSoberSeconds)/$soberTime sec - keep breathing steadily."
+
+        if ($val -lt $minBlowingVal) {
+            Write-Log "Breath interrupted! Resetting counter." "Yellow"
+            $ui.Headline.Text = "Breath interrupted - blow again"
+            $state.ConsecutiveSoberSeconds = 0
+            $state.IsBlowingStarted = $false
+        }
+        elseif ($val -lt $threshold) {
+            $state.ConsecutiveSoberSeconds++
+            if ($state.ConsecutiveSoberSeconds -ge $soberTime) {
+                Write-Log "Successful breath test! Access restored." "Green"
+                $ui.Headline.Text = "Success!"
+                $ui.Detail.Text = "You are clear. Closing this window..."
+                $state.AllowClose = $true
+                $timer.Stop()
+                $closeTimer = New-Object System.Windows.Forms.Timer
+                $closeTimer.Interval = 700
+                $closeTimer.Add_Tick({ $closeTimer.Stop(); $form.Close() }.GetNewClosure())
+                $closeTimer.Start()
+            }
+        }
+        else {
+            Write-Log "ALCOHOL DETECTED IN BREATH! ($val >= $threshold)" "Red"
+            $ui.Headline.Text = "Still over the limit"
+            $ui.Detail.Text = "Reading: $val  (limit: $threshold)`nWait for the sensor to clear, then try again."
+            $state.ConsecutiveSoberSeconds = 0
+            $state.IsBlowingStarted = $false
+        }
+
+        $state.PrevVal = $val
+    }.GetNewClosure())
+
+    $form.Add_Shown({ $form.Activate(); $ui.PasswordBox.Focus() }.GetNewClosure())
+    $timer.Start()
+    $form.ShowDialog() | Out-Null
+    $timer.Stop()
+    $timer.Dispose()
+}
+
+function Show-WaitingOverlay {
+    # Simpler overlay for scenarios with no live sensor data to test against
+    # (sensor disconnected, port failed to open): shows a message and only
+    # accepts the master password, optionally auto-closing via $checkAction
+    # (e.g. polling for the sensor to reconnect).
+    param(
+        [string]$message,
+        [scriptblock]$checkAction = $null,
+        [int]$checkIntervalMs = 1000
+    )
+
+    $ctrl = @{ AllowClose = $false }
+    $ui = New-OverlayForm
+    $form = $ui.Form
+    $ui.Headline.Text = "AlcoLock"
+    $ui.Detail.Text = $message
+
+    $form.Add_FormClosing({
+        param($s, $e)
+        if (-not $ctrl.AllowClose) { $e.Cancel = $true }
+    }.GetNewClosure())
+
+    $tryUnlock = {
+        if ($ui.PasswordBox.Text -eq $masterPass) {
+            $ctrl.AllowClose = $true
+            $form.Close()
+        } else {
+            $ui.ErrorLabel.Text = "Incorrect password."
+            $ui.PasswordBox.Text = ""
+        }
+    }.GetNewClosure()
+
+    $ui.UnlockButton.Add_Click($tryUnlock)
+    $ui.PasswordBox.Add_KeyDown({
+        param($s, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { & $tryUnlock }
+    }.GetNewClosure())
+
+    $timer = $null
+    if ($checkAction) {
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = $checkIntervalMs
+        $timer.Add_Tick({
+            if (& $checkAction) {
+                $ctrl.AllowClose = $true
+                $timer.Stop()
+                $form.Close()
+            }
+        }.GetNewClosure())
+        $timer.Start()
+    }
+
+    $form.Add_Shown({ $form.Activate(); $ui.PasswordBox.Focus() }.GetNewClosure())
+    $form.ShowDialog() | Out-Null
+    if ($timer) { $timer.Stop(); $timer.Dispose() }
 }
 
 # --- REMOVAL AND FULL CLEANUP ---
@@ -416,115 +704,6 @@ function Initialize-Baseline {
     return $baselineVal
 }
 
-# --- SHARED BREATH-TEST AND VALIDATION LOGIC ---
-function Start-SoberVerificationLoop {
-    param(
-        [System.IO.Ports.SerialPort]$serialPort,
-        [int]$baselineVal
-    )
-
-    try { $serialPort.DiscardInBuffer() } catch {}
-
-    $rearmThreshold = $baselineVal + 40   # Level the chamber must drop below to be considered clear
-    $minBlowingVal  = $baselineVal + 10   # Minimum level for a clean breath
-    $deltaTrigger   = 15                  # Minimum sharp jump (+15) to detect an impulse
-
-    # ---------------------------------------------------------
-    # STAGE 1: Waiting for the sensor chamber to clear of previous vapors (Re-arm)
-    # ---------------------------------------------------------
-    Write-Log "LOCKED! Waiting for the sensor chamber to clear (value must drop below $rearmThreshold)..." "Red"
-
-    # Remember the actual last sensor value from the clearing stage,
-    # so we don't "inherit" a stale baseline when moving to Stage 2
-    $lastRearmVal = $baselineVal
-
-    while ($true) {
-        Invoke-LockPC
-        try {
-            $line = $serialPort.ReadLine().Trim()
-            if ($line -match '^\d+$') {
-                [int]$val = $line
-                $lastRearmVal = $val
-                if ($val -le $rearmThreshold) {
-                    Write-Log "Chamber cleared ($val <= $rearmThreshold). System ready for a new breath test!" "Green"
-                    break
-                } else {
-                    Write-Log "Clearing chamber: $val (waiting for <= $rearmThreshold)" "DarkGray"
-                }
-            }
-        } catch {}
-        Start-Sleep -Milliseconds 500
-    }
-
-    # ---------------------------------------------------------
-    # STAGE 2: Waiting for an ACTIVE breath IMPULSE and measurement
-    # ---------------------------------------------------------
-    Write-Log "Waiting for a sharp breath (impulse +$deltaTrigger over 0.5s, corridor: from $minBlowingVal to $threshold)..." "Yellow"
-
-    $consecutiveSoberSeconds = 0
-    $isBlowingStarted = $false
-    # IMPORTANT: use the actual last sensor value (end of chamber clearing),
-    # NOT $baselineVal - otherwise the very first reading would produce a fake "jump"
-    # relative to a long-stale background level and falsely trigger as a breath
-    $prevVal = $lastRearmVal
-
-    while ($true) {
-        Invoke-LockPC
-
-        try {
-            $line = $serialPort.ReadLine().Trim()
-            if ($line -match '^\d+$') {
-                [int]$val = $line
-                $delta = $val - $prevVal  # Calculate the rate of change of the value
-
-                # 1. Detect the start of a breath by IMPULSE (sharp upward jump)
-                if (-not $isBlowingStarted) {
-                    if ($delta -ge $deltaTrigger -and $val -ge $minBlowingVal) {
-                        $isBlowingStarted = $true
-                        Write-Log "Breath IMPULSE detected! (Jump of +$delta, current: $val). Measuring sobriety ($soberTime sec)..." "Yellow"
-                    } else {
-                        Write-Log "Waiting for breath... Value: $val (Delta: $delta, need jump >= +$deltaTrigger)" "DarkGray"
-                        $prevVal = $val
-                        Start-Sleep -Milliseconds 500
-                        continue
-                    }
-                }
-
-                # 2. Evaluate the breath itself during the blow
-                Write-Log "Blowing: $val (Corridor: $minBlowingVal - $threshold, Progress: $consecutiveSoberSeconds/$soberTime sec)" "Magenta"
-
-                # Breath interrupted (value dropped below the minimum blowing level)
-                if ($val -lt $minBlowingVal) {
-                    Write-Log "Breath interrupted! Resetting counter." "Yellow"
-                    $consecutiveSoberSeconds = 0
-                    $isBlowingStarted = $false
-                }
-                # Sober breath (within the corridor)
-                elseif ($val -lt $threshold) {
-                    $consecutiveSoberSeconds++
-                    if ($consecutiveSoberSeconds -ge $soberTime) {
-                        Write-Log "Successful breath test! Access restored." "Green"
-                        break
-                    }
-                }
-                # Drunk breath (alcohol threshold exceeded)
-                else {
-                    Write-Log "ALCOHOL DETECTED IN BREATH! ($val >= $threshold)" "Red"
-                    $consecutiveSoberSeconds = 0
-                    $isBlowingStarted = $false
-                }
-
-                $prevVal = $val
-            }
-        }
-        catch {
-            Write-Log "Error reading during breath test (sensor disconnected?)" "Red"
-        }
-
-        Start-Sleep -Milliseconds 500
-    }
-}
-
 # --- MAIN OPERATING LOOP ---
 Write-Log "Starting AlcoLock. Mode: $Mode." "Green"
 if ($Debug) { Write-Log "DEBUG MODE ACTIVE" "Yellow" }
@@ -542,8 +721,7 @@ try {
 
     if ($Mode -eq "Normal") {
         # ================= NORMAL MODE =================
-        Invoke-LockPC
-        Start-SoberVerificationLoop -serialPort $serialPort -baselineVal $globalBaseline
+        Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
         Write-Log "Authentication session complete. Script will exit until next hour." "Cyan"
 
     } else {
@@ -557,25 +735,24 @@ try {
 
                     if ($val -gt $threshold) {
                         Write-Log "THRESHOLD EXCEEDED! ($val > $threshold)" "Red"
-                        Invoke-LockPC
                         # Reuse the already-known $globalBaseline, without another 10-sec warmup
-                        Start-SoberVerificationLoop -serialPort $serialPort -baselineVal $globalBaseline
+                        Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
                     }
                 }
             }
             catch {
                 Write-Log "WARNING: SENSOR DISCONNECTED OR COM PORT CONNECTION LOST!" "Red"
-                Invoke-LockPC
-                
-                while (-not $serialPort.IsOpen) {
-                    Invoke-LockPC
-                    Start-Sleep -Seconds 1
+
+                Show-WaitingOverlay -message "Sensor disconnected. Reconnect the device to unlock, or enter the master password." -checkAction {
                     try { $serialPort.Open() } catch {}
+                    return $serialPort.IsOpen
+                } -checkIntervalMs 1000
+
+                if ($serialPort.IsOpen) {
+                    # Recalibrate clean air on reconnect
+                    $globalBaseline = Initialize-Baseline -serialPort $serialPort
+                    Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
                 }
-                
-                # Recalibrate clean air on reconnect
-                $globalBaseline = Initialize-Baseline -serialPort $serialPort
-                Start-SoberVerificationLoop -serialPort $serialPort -baselineVal $globalBaseline
             }
 
             Start-Sleep -Seconds 2
@@ -585,7 +762,9 @@ try {
 catch {
     Write-Log "Error opening COM port: $_" "Red"
     if ($Mode -eq "Quiet") {
-        Invoke-LockPC
+        Show-WaitingOverlay -message "Could not open the sensor's serial port. Reconnect the device to unlock, or enter the master password." -checkAction {
+            try { $serialPort.Open(); return $serialPort.IsOpen } catch { return $false }
+        } -checkIntervalMs 2000
     }
 }
 finally {

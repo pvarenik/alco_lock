@@ -1,29 +1,31 @@
 # AlcoLock
 
-A breathalyzer-gated screen lock. An MQ-3 alcohol sensor connected to an
+A breathalyzer-gated action blocker. An MQ-3 alcohol sensor connected to an
 Arduino-compatible board feeds live readings over serial to a host-side
-script, which locks the session whenever the reading exceeds a configured
-threshold — and only unlocks it after a genuine, fresh, sober breath is
-measured.
+script, which throws up a fullscreen, always-on-top window whenever the
+reading exceeds a configured threshold — and only lets you back in after a
+genuine, fresh, sober breath is measured (or you type a master password).
 
 Two equivalent implementations are provided:
 
-- **`alco_lock.ps1`** — PowerShell, for Windows (primary deployment target).
+- **`alco_lock.ps1`** — PowerShell, for Windows.
 - **`alco_lock.py`** — Python, for Linux (see [Linux (Python) version](#linux-python-version)).
 
 Both share the identical sensor-verification logic; only the OS-integration
-pieces (screen lock, password prompt, autostart) differ.
+pieces (the overlay's GUI toolkit, autostart mechanism) differ.
 
-> Personal self-discipline tool. Not a certified breathalyzer, not a legal
+> Personal joke/self-discipline project: a device that blocks a drunk person
+> from using their own computer. Not a certified breathalyzer, not a legal
 > sobriety test, and not a substitute for one.
 
 ## How it works
 
 1. On startup, the script warms up the sensor and calibrates a **clean-air
    baseline** (average reading with no breath on the sensor).
-2. It continuously watches the sensor. If a reading exceeds `$threshold`, the
-   workstation is locked immediately.
-3. To unlock, two things must happen in order:
+2. It continuously watches the sensor. If a reading exceeds `$threshold`, a
+   **fullscreen window opens on top of everything else** — borderless, no
+   close button, always-on-top.
+3. To make it go away, two things must happen in order:
    - **Re-arm**: the sensor chamber must clear back down close to baseline
      (residual alcohol vapor has to dissipate first).
    - **Fresh breath**: a genuine active breath is detected as a *sharp
@@ -31,12 +33,49 @@ pieces (screen lock, password prompt, autostart) differ.
      the previous test. The reading must then stay inside the sober corridor
      for `$soberTime` consecutive seconds.
 4. If the breath sample exceeds the threshold, the counter resets and the
-   cycle repeats.
+   cycle repeats — all shown live in the window (current reading, what stage
+   you're in, countdown progress).
+5. At any point, typing the correct **master password** into the field at
+   the bottom of the window closes it immediately, bypassing the breath
+   check entirely.
 
-This two-stage design exists specifically to prevent a false unlock from
-residual vapor slowly clearing after one real (or simulated) breath — see
+This two-stage sensor design (re-arm + impulse, not just re-arm) exists
+specifically to prevent a false unlock from residual vapor slowly clearing
+after one real (or simulated) breath — see
 [Known limitations](#known-limitations) for the underlying failure mode this
 avoids.
+
+### Why an app window instead of a real OS lock
+
+Earlier versions of this project called the real OS session lock
+(`LockWorkStation` on Windows, `loginctl lock-session` on Linux). That turned
+out to be the wrong tool for the job:
+
+- It hands the actual unlock step over to the **Windows/Linux account
+  password**, which has nothing to do with this project and isn't something
+  you want a script fighting you over.
+- Windows' lock screen runs on an isolated **Secure Desktop** that no
+  ordinary process can draw custom UI on top of — so there was no way to
+  show live sensor readings, timers, or a reason while it was up.
+- On Linux, a real lock only happens if a locker daemon is installed and
+  listening for the signal; otherwise `loginctl lock-session` is a no-op
+  that looks like it worked but doesn't.
+- Worst of all: nothing stopped the verification loop from calling the real
+  lock again 0.5 seconds after you legitimately logged back in, with no
+  explanation - which looked exactly like a broken infinite lock loop.
+
+So this project doesn't touch the OS session lock at all anymore. The
+fullscreen window **is** the entire mechanism: an ordinary top-level
+application window, deliberately configured to be hard to ignore (no
+border, no close button, always-on-top, covers the whole screen), that
+your own script fully controls and can show anything in.
+
+This is *not* a hardened kiosk lock. It doesn't install keyboard hooks and
+doesn't try to block Task Manager, Ctrl+Alt+Del, or the Windows/Super key -
+a determined user (i.e., you, five minutes from now) can always get out via
+Task Manager / `pkill`. That's intentional: this is a personal joke device,
+not something that should risk trapping you with no way out if it ever hits
+a bug.
 
 ## Hardware
 
@@ -52,11 +91,13 @@ host-side (PC) logic only.
 
 ## Requirements
 
-- PowerShell 7+ (`pwsh`) — developed and tested cross-platform (Linux for
-  development/debugging, Windows for deployment).
-- Windows is required for actual screen locking (`LockWorkStation`) and for
-  autostart via Task Scheduler. On Linux, the script runs and logs normally
-  but cannot lock the screen or self-install.
+**Windows (`alco_lock.ps1`):**
+- PowerShell 7+ (`pwsh`), or Windows PowerShell 5.1.
+- `System.Windows.Forms` / `System.Drawing` (built into .NET on Windows,
+  loaded automatically - nothing extra to install).
+
+**Linux (`alco_lock.py`):** see [Requirements](#requirements-1) under the
+Linux section below.
 
 ## Installation
 
@@ -88,26 +129,23 @@ PowerShell help reference.
 
 | Parameter            | Description |
 |-----------------------|-------------|
-| `-Mode Normal\|Quiet`  | `Normal`: lock once immediately, verify sobriety, then exit. `Quiet` (default for real use): run continuously in the background and lock only when the threshold is exceeded. Default: `Normal`. |
-| `-Debug` / `-d`        | Dry run. Skips autostart installation; logs what *would* lock/unlock instead of actually calling `LockWorkStation` or requiring a real password. |
+| `-Mode Normal\|Quiet`  | `Normal`: show the overlay once immediately, verify sobriety, then exit. `Quiet` (default for real use): run continuously in the background and only show the overlay when the threshold is exceeded. Default: `Normal`. |
+| `-Debug` / `-d`        | Skips autostart installation and the `-Cleanup` password prompt. The overlay itself always runs the same either way - it's an app window, not a real OS lock, so it's always safe to test. |
 | `-Port <name>`         | Force a specific serial port (`COM5`, `/dev/ttyACM0`, etc.), bypassing autodetection. |
 | `-Cleanup` / `-DisableAutostart` | Fully remove the scheduled task and installed files, after confirming the master password. |
-| `-Help` / `-h` / `-?`  | Print usage and examples, then exit — no sensor, autostart, or locking logic runs. |
+| `-Help` / `-h` / `-?`  | Print usage and examples, then exit — no sensor, autostart, or overlay logic runs. |
 
 ### Examples
 
 ```powershell
-# Normal use: background monitoring, real locking, autodetected port
+# Normal use: background monitoring, autodetected port
 .\alco_lock.ps1 -Mode Quiet
 
-# Safe dry run: watch sensor + fake lock/unlock logs, no real locking
+# Test the overlay without installing autostart
 .\alco_lock.ps1 -Mode Quiet -Debug
 
 # Force a specific port when multiple serial devices are connected
 .\alco_lock.ps1 -Mode Quiet -Port COM5
-
-# Test on Linux against a specific device node
-.\alco_lock.ps1 -Port /dev/ttyACM0 -Debug
 
 # Uninstall
 .\alco_lock.ps1 -Cleanup
@@ -138,10 +176,10 @@ All tunables live at the top of the script:
 $threshold  = 350   # Raw ADC reading that counts as "alcohol detected"
 $soberTime  = 5     # Consecutive seconds within the sober range to unlock
 $warmupSec  = 10    # Sensor warmup/calibration duration on startup
-$masterPass = "..."  # Used only by -Cleanup to authorize uninstall
+$masterPass = "..."  # Bypasses the overlay entirely when typed into it
 ```
 
-Also inside `Start-SoberVerificationLoop`:
+Also inside `Show-VerificationOverlay`:
 
 ```powershell
 $rearmThreshold = $baselineVal + 40  # Chamber must clear below this to re-arm
@@ -159,10 +197,11 @@ and ambient conditions — expect to tune them after a few real test runs.
 
 ## Known limitations
 
-- **No real Windows unlock is performed.** The script *locks* the session via
-  `LockWorkStation`; the actual password entry to unlock Windows is still
-  done by the user. AlcoLock only decides *when* to force that lock screen up
-  and re-lock the session if you unlock before passing a breath test.
+- **This is an app-level window, not a real OS lock — on purpose** (see
+  [Why an app window instead of a real OS lock](#why-an-app-window-instead-of-a-real-os-lock)
+  above). A determined user can always exit via Task Manager, killing the
+  process, or similar. That's an accepted tradeoff for a personal joke
+  device with no hard-lockout risk, not an oversight.
 - **False-unlock from residual vapor**: earlier versions of this script could
   misinterpret a slowly-clearing sensor reading (left over from a previous
   breath) as a fresh sober breath, because the impulse-detection baseline was
@@ -174,11 +213,9 @@ and ambient conditions — expect to tune them after a few real test runs.
   times in the range of minutes for a stable baseline. Tune `$warmupSec` for
   your hardware.
 - **No native USB HID.** A plain Uno/ATmega328 + CH340 board only has a
-  serial link to the PC — it cannot emulate a keyboard. If you want the board
-  itself to trigger `Win+L` without any host script running, you need a board
-  with native USB HID (Leonardo, Micro, Pro Micro, Due, ESP32-S3, RP2040,
-  etc.) and its own tradeoffs (antivirus/EDR may flag keystroke-injection
-  capable USB devices).
+  serial link to the PC — it cannot emulate a keyboard, so the board itself
+  can't trigger anything on its own; the host script is what shows the
+  overlay.
 
 ## Linux (Python) version
 
@@ -189,8 +226,7 @@ adapted to Linux equivalents instead of Windows APIs:
 
 | Windows (`alco_lock.ps1`)        | Linux (`alco_lock.py`)                          |
 |-----------------------------------|--------------------------------------------------|
-| `rundll32 user32.dll,LockWorkStation` | `loginctl lock-session` (falls back to `xdg-screensaver`, `dm-tool`, `gnome-screensaver-command`, `cinnamon-screensaver-command`, or `xscreensaver-command` — whichever is available) |
-| GUI password dialog (WinForms)   | Console prompt via `getpass`                      |
+| Fullscreen overlay via `System.Windows.Forms` | Fullscreen overlay via `tkinter` |
 | Task Scheduler (`Normal`: hourly trigger, `Quiet`: at logon) | `systemd --user` timer (`alcolock.timer`, hourly) for `Normal`; `systemd --user` service (`alcolock.service`, `WantedBy=default.target`) for `Quiet` |
 | `C:\ProgramData\AlcoLock`        | `~/.local/share/alcolock`                         |
 
@@ -201,6 +237,17 @@ adapted to Linux equivalents instead of Windows APIs:
   ```bash
   pip install pyserial --break-system-packages
   ```
+- `python3-tk`, for the GUI overlay (usually a separate OS package from
+  `python3` itself):
+  ```bash
+  sudo apt install python3-tk        # Debian/Ubuntu
+  sudo dnf install python3-tkinter   # Fedora
+  sudo pacman -S tk                  # Arch
+  ```
+  If it's missing, the script falls back to console-only logging (plus a
+  single `notify-send` alert, if available) instead of crashing - but you
+  lose the actual blocking window, which defeats the point. Install it for
+  real use.
 
 ### Usage
 
@@ -211,10 +258,10 @@ alco_lock.py [--mode Normal|Quiet] [--debug] [--port <device>] [--cleanup]
 Run `alco_lock.py --help` for the full list of options and examples.
 
 ```bash
-# Normal use: background monitoring, real locking, autodetected port
+# Normal use: background monitoring, autodetected port
 python3 alco_lock.py --mode Quiet
 
-# Safe dry run: watch sensor + fake lock/unlock logs, no real locking
+# Test the overlay without installing autostart
 python3 alco_lock.py --mode Quiet --debug
 
 # Force a specific device when multiple serial adapters are connected
@@ -226,100 +273,28 @@ python3 alco_lock.py --cleanup
 
 ### Notes specific to the Linux version
 
-- **Screen-lock command availability varies by desktop environment.** The
-  script tries several common ones in order and logs a warning if none are
-  found — check that at least one of them works on your system before
-  relying on this for real (test with `--debug` off in a throwaway session
-  first, or just run the lock command by hand to confirm it works).
 - **Port autodetection** matches the same `Arduino`/`CH340`/`CH341`/
   `CP210x`/`FTDI`/`USB-SERIAL` description patterns as the Windows version,
   falling back to `/dev/ttyACM*` then `/dev/ttyUSB*` by device node.
 - Self-install (`install_self`) writes to `~/.config/systemd/user/`, which
   requires a user systemd instance (the default on virtually all modern
   distros with systemd; not applicable on non-systemd init systems).
+- **GUI + systemd caveat**: a `systemd --user` service doesn't automatically
+  inherit your graphical session's `DISPLAY`/`XAUTHORITY`, which `tkinter`
+  needs to open a window. `install_self` captures these from the environment
+  at install time and bakes them into the generated `alcolock.service` unit,
+  so run the install step from your actual desktop session (not over a
+  plain SSH connection without X forwarding). If the window still doesn't
+  appear after installing, check `alcolock.log` for a warning and re-run the
+  install from your desktop.
 
-## Notifications and visibility
+## Logging
 
-Both implementations now actively tell you what's happening instead of
-silently locking and unlocking:
-
-- **Desktop notifications** at every meaningful transition: why you were
-  locked, live sensor readings while waiting for the chamber to clear,
-  breath-test progress (`X/5 sec`), and the final success/failure/interrupted
-  outcome. Windows uses a system tray balloon tip (`NotifyIcon`, no extra
-  install needed); Linux uses `notify-send` if available.
-- **Real lock-state detection**, instead of blindly re-issuing the lock
-  command on every 0.5s poll: Windows checks whether `logonui.exe` (the
-  process that draws the lock screen) is running; Linux checks
-  `loginctl show-session $XDG_SESSION_ID -p LockedHint`. The script only
-  re-locks (and re-notifies) when it detects you've actually gotten back to
-  an unlocked desktop — which also happens to be the only moment a
-  notification can render at all.
-- **A persistent log file** (`alcolock.log` in the install directory) mirrors
-  everything printed to the console, so the full process is reviewable
-  afterward even when running invisibly in `Quiet` mode (as a hidden
-  scheduled task / systemd service with no visible window).
-
-### Why you can't see anything *during* the actual lock screen
-
-This is an intentional OS security boundary, not a gap in the script: Windows
-renders its lock screen on a separate **Secure Desktop**, and Linux screen
-lockers run as their own isolated surface — neither lets an ordinary
-process draw custom UI on top of them. So notifications only appear in the
-brief window when you're genuinely back at your desktop (right before the
-script re-locks it), not while the lock screen itself is showing. That
-window is exactly when the "why am I locked again?" explanation is most
-useful anyway.
-
-### Linux-specific caveat: no locker daemon = no real lock
-
-`loginctl lock-session` only sends a signal to systemd-logind saying "mark
-this session as locked" — it does **not** draw a password screen by itself.
-An actual lock screen only appears if a locker daemon (`light-locker`,
-`gnome-screensaver`, `xscreensaver`, `i3lock` + a wrapper, etc.) is running
-and subscribed to that signal. If none is installed/running, the session is
-marked "locked" internally but nothing visually changes and there's no
-password prompt to bypass — which is very likely what you're seeing if the
-script appears to loop without ever asking for a password. Install and
-enable one of the above for your desktop environment if you want a real,
-enforced lock.
-
-## GUI lock overlay (Linux)
-
-Since Linux has no guaranteed equivalent of Windows' Secure Desktop lock
-screen (see the locker-daemon caveat above), `alco_lock.py` enforces the
-lock itself with its own always-on-top window, built with `tkinter`. This
-window **is** the barrier - it opens whenever the threshold is exceeded, and
-the only ways out are:
-
-1. A genuine sober breath (the same re-arm + impulse-detection logic
-   described above, running live and updating the window as it happens), or
-2. Typing the master password into the field at the bottom of the window.
-
-The window disables its own close button, stays topmost and fullscreen, and
-also fires a best-effort real OS-level lock (`loginctl lock-session` etc.)
-underneath as defense in depth, in case a locker daemon *is* present.
-
-Requirements: `python3-tk` (usually a separate OS package from `python3`
-itself):
-```bash
-sudo apt install python3-tk        # Debian/Ubuntu
-sudo dnf install python3-tkinter   # Fedora
-sudo pacman -S tk                  # Arch
-```
-If it's missing, the script falls back to console-only enforcement (same
-behavior as before) rather than crashing.
-
-### GUI + systemd caveat
-
-A `systemd --user` service doesn't automatically inherit your graphical
-session's `DISPLAY`/`XAUTHORITY`, which `tkinter` needs to open a window.
-`install_self` captures these from the environment at install time and
-bakes them into the generated `alcolock.service` unit, so run the install
-step from your actual desktop session (not over a plain SSH connection
-without X forwarding) for the GUI to work once installed. If the window
-still doesn't appear after installing, check `alcolock.log` for a
-`DISPLAY/XAUTHORITY` warning and re-run the install from your desktop.
+Both versions write a persistent, plain-text log (`alcolock.log`, in the
+install directory) mirroring everything printed to the console, so the
+whole process is reviewable afterward even when running invisibly in
+`Quiet` mode (as a hidden scheduled task / systemd service with no visible
+console window).
 
 ## Uninstalling
 
@@ -328,7 +303,8 @@ still doesn't appear after installing, check `alcolock.log` for a
 ```
 
 Prompts for the master password, then removes the scheduled task and the
-`C:\ProgramData\AlcoLock` directory.
+`C:\ProgramData\AlcoLock` directory. On Linux, the equivalent is
+`python3 alco_lock.py --cleanup`.
 
 ## License
 

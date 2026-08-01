@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """
-AlcoLock (Linux) - breathalyzer-gated screen lock.
+AlcoLock (Linux) - breathalyzer-gated action blocker.
 
 Reads sensor readings from a serial port (Arduino/MQ-3), calibrates a
-clean-air baseline on startup, and locks the session whenever the reading
-exceeds the configured threshold. Access is restored only after a genuine
-fresh breath (detected as a sharp impulse, not just a slowly-clearing
-residual reading) stays within the sober range for several consecutive
-seconds.
+clean-air baseline on startup, and shows a fullscreen, always-on-top window
+whenever the reading exceeds the configured threshold. This is an app-level
+overlay (not a real session lock via loginctl/a screen locker) - it stays on
+top of everything and disables its own close button, and only closes after
+a genuine fresh breath (detected as a sharp impulse, not just a
+slowly-clearing residual reading) stays within the sober range for several
+consecutive seconds, or the master password is entered.
 
 Modes:
-  Normal - locks once immediately, verifies sobriety, then exits (meant to
-           be re-triggered hourly via a systemd timer).
+  Normal - shows the overlay once immediately, verifies sobriety, then exits
+           (meant to be re-triggered hourly via a systemd timer).
   Quiet  - stays running in the background, silently monitoring the sensor,
-           and only locks when the threshold is actually exceeded.
+           and only shows the overlay when the threshold is actually exceeded.
 
 Examples:
   alco_lock.py
@@ -23,7 +25,9 @@ Examples:
       Runs continuously in the background (installed at login via systemd).
 
   alco_lock.py --mode Quiet --debug
-      Safe dry run: background monitoring with fake locking (logs only).
+      Skips autostart install and the -Cleanup password prompt; the overlay
+      itself still runs normally either way (it's an app window, not a real
+      session lock, so it's always safe to test).
 
   alco_lock.py --mode Quiet --port /dev/ttyACM0
       Forces a specific serial device instead of autodetecting.
@@ -33,6 +37,8 @@ Examples:
       systemd unit(s) and installed files.
 
 Requires: pyserial (pip install pyserial --break-system-packages)
+          python3-tk (for the GUI overlay; falls back to console-only
+          enforcement if not installed)
 """
 
 import argparse
@@ -168,15 +174,10 @@ def resolve_serial_port(override=""):
     )
 
 
-# --- SESSION LOCK, NOTIFICATIONS, AND PASSWORD PROMPT ---
-_notify_last_shown = {}
-
-
+# --- DESKTOP NOTIFICATION (used only as a fallback signal when the GUI
+#     overlay itself isn't available - see run_lock_overlay) ---
 def show_notification(title, message, urgency="normal"):
     # urgency: "low", "normal", "critical" (notify-send levels).
-    # Some desktop environments render "critical" notifications even over
-    # the lock screen; most only show notifications once you're back at an
-    # unlocked, interactive desktop.
     if shutil.which("notify-send"):
         try:
             subprocess.run(
@@ -189,98 +190,6 @@ def show_notification(title, message, urgency="normal"):
     # Fallback: at least put it in the log clearly if no notifier is available.
     log(f"[NOTIFY] {title} - {message}", "Cyan")
 
-
-def show_notification_throttled(key, title, message, urgency="normal", min_interval_sec=5):
-    # Same as show_notification, but skips repeats of the same message "key"
-    # within min_interval_sec - prevents flooding the notification area
-    # every 0.5s while a stage is still in progress.
-    now = time.monotonic()
-    last = _notify_last_shown.get(key)
-    if last is not None and (now - last) < min_interval_sec:
-        return
-    _notify_last_shown[key] = now
-    show_notification(title, message, urgency)
-
-
-def is_session_locked():
-    # Best-effort check of whether the session is *actually* still locked
-    # right now, so we don't blindly re-issue a lock call (and a matching
-    # notification) on every single poll tick.
-    session_id = os.environ.get("XDG_SESSION_ID")
-    if not session_id:
-        return False
-    try:
-        result = subprocess.run(
-            ["loginctl", "show-session", session_id, "-p", "LockedHint", "--value"],
-            capture_output=True, text=True, timeout=2,
-        )
-        return result.stdout.strip() == "yes"
-    except Exception:
-        return False
-
-
-_last_lock_call = 0.0
-_last_lock_warn = 0.0
-
-
-def invoke_lock(debug, reason=""):
-    global _last_lock_call, _last_lock_warn
-
-    if debug:
-        now = time.monotonic()
-        if now - _last_lock_call < 3:
-            return
-        _last_lock_call = now
-        suffix = f" Reason: {reason}" if reason else ""
-        log(f"[DEBUG] >>> SESSION LOCK CALL <<<{suffix}", "Red")
-        return
-
-    if is_session_locked():
-        # Already locked - nothing to do. This is the fix for the "instant,
-        # unexplained re-lock loop": we no longer call the lock command on
-        # every 0.5s tick regardless of state.
-        return
-
-    # The session is NOT locked right now - either this is the very first
-    # lock of this stage, or the user just authenticated back in. This is
-    # also the only moment a notification can actually be seen (you cannot
-    # draw custom UI over the real lock screen - that's an OS security
-    # boundary, not a limitation of this script) - so explain why before
-    # locking again.
-    if reason:
-        show_notification("AlcoLock", reason, urgency="normal")
-
-    # Try a few common session-lock mechanisms, in order of portability.
-    # Which ones are actually available depends on your desktop environment.
-    # NOTE: if none of these are available (no locker daemon registered),
-    # the call below may silently do nothing visually even though it
-    # "succeeds" - see the README for why this depends on your DE.
-    lock_commands = [
-        ["loginctl", "lock-session"],
-        ["xdg-screensaver", "lock"],
-        ["dm-tool", "lock"],
-        ["gnome-screensaver-command", "-l"],
-        ["cinnamon-screensaver-command", "-l"],
-        ["xscreensaver-command", "-lock"],
-    ]
-    for cmd in lock_commands:
-        if shutil.which(cmd[0]):
-            try:
-                subprocess.run(
-                    cmd, check=True,
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
-                return
-            except subprocess.CalledProcessError:
-                continue
-
-    now = time.monotonic()
-    if now - _last_lock_warn >= 10:
-        _last_lock_warn = now
-        log("[WARNING] Could not find a working screen-lock command for this "
-            "desktop environment. Tried: loginctl, xdg-screensaver, dm-tool, "
-            "gnome-screensaver-command, cinnamon-screensaver-command, "
-            "xscreensaver-command.", "Yellow")
 
 
 def prompt_master_password(debug):
@@ -467,10 +376,6 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
             log("Master password override accepted - skipping the rest of the breath verification.", "Yellow")
             return
 
-        invoke_lock(debug, reason=(
-            f"Alcohol detected. Waiting for the sensor to clear before you can "
-            f"retest (currently {last_rearm_val}, need <= {rearm_threshold}). Do not blow yet."
-        ))
         try:
             line = ser.readline().decode(errors="ignore").strip()
             if line.isdigit():
@@ -478,18 +383,11 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
                 last_rearm_val = val
                 if val <= rearm_threshold:
                     log(f"Chamber cleared ({val} <= {rearm_threshold}). System ready for a new breath test!", "Green")
-                    show_notification("AlcoLock", "Sensor cleared. You can breathe into the sensor now.", "normal")
                     if status_cb:
                         status_cb("Sensor cleared!", "You can breathe into the sensor now.")
                     break
                 else:
                     log(f"Clearing chamber: {val} (waiting for <= {rearm_threshold})", "DarkGray")
-                    show_notification_throttled(
-                        "rearm", "AlcoLock - Locked",
-                        f"Sensor still elevated: {val} (need <= {rearm_threshold}). "
-                        f"Waiting for it to clear - do not blow yet.",
-                        urgency="normal", min_interval_sec=5,
-                    )
                     if status_cb:
                         status_cb(
                             "🔒 Alcohol detected - waiting for the sensor to clear",
@@ -517,11 +415,6 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
             log("Master password override accepted - skipping the rest of the breath verification.", "Yellow")
             return
 
-        invoke_lock(debug, reason=(
-            f"Waiting for a breath test. Blow into the sensor now: needs a sharp "
-            f"jump above {min_blowing_val}, then stay below {THRESHOLD} for {SOBER_TIME} sec."
-        ))
-
         try:
             line = ser.readline().decode(errors="ignore").strip()
             if line.isdigit():
@@ -534,11 +427,6 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
                         is_blowing_started = True
                         log(f"Breath IMPULSE detected! (Jump of +{delta}, current: {val}). "
                             f"Measuring sobriety ({SOBER_TIME} sec)...", "Yellow")
-                        show_notification(
-                            "AlcoLock",
-                            f"Breath detected! Keep breathing steadily for {SOBER_TIME} seconds...",
-                            "normal",
-                        )
                     else:
                         log(f"Waiting for breath... Value: {val} (Delta: {delta}, "
                             f"need jump >= +{delta_trigger})", "DarkGray")
@@ -554,12 +442,6 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
                 # 2. Evaluate the breath itself during the blow
                 log(f"Blowing: {val} (Corridor: {min_blowing_val} - {THRESHOLD}, "
                     f"Progress: {consecutive_sober_seconds}/{SOBER_TIME} sec)", "Magenta")
-                show_notification_throttled(
-                    "blow-progress", "AlcoLock - Measuring",
-                    f"Reading: {val} (need < {THRESHOLD}). Sober for "
-                    f"{consecutive_sober_seconds}/{SOBER_TIME} sec - keep breathing steadily.",
-                    urgency="normal", min_interval_sec=1,
-                )
                 if status_cb:
                     status_cb(
                         "📏 Measuring your breath...",
@@ -570,9 +452,6 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
                 if val < min_blowing_val:
                     # Breath interrupted
                     log("Breath interrupted! Resetting counter.", "Yellow")
-                    show_notification(
-                        "AlcoLock", "Breath interrupted - the test reset. Blow into the sensor again.", "normal",
-                    )
                     if status_cb:
                         status_cb("⚠️ Breath interrupted", "The test reset - blow into the sensor again.")
                     consecutive_sober_seconds = 0
@@ -582,20 +461,12 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
                     consecutive_sober_seconds += 1
                     if consecutive_sober_seconds >= SOBER_TIME:
                         log("Successful breath test! Access restored.", "Green")
-                        show_notification(
-                            "AlcoLock", "Success! You are clear - the screen will stay unlocked.", "normal",
-                        )
                         if status_cb:
                             status_cb("✅ Success!", "You are clear. Closing this window...")
                         break
                 else:
                     # Drunk breath (alcohol threshold exceeded)
                     log(f"ALCOHOL DETECTED IN BREATH! ({val} >= {THRESHOLD})", "Red")
-                    show_notification(
-                        "AlcoLock",
-                        f"Still over the limit ({val} >= {THRESHOLD}). Wait for the sensor to clear, then try again.",
-                        "critical",
-                    )
                     if status_cb:
                         status_cb(
                             "❌ Still over the limit",
@@ -611,16 +482,22 @@ def start_sober_verification_loop(ser, baseline_val, debug, status_cb=None, over
         time.sleep(0.5)
 
 
-# --- GUI LOCK OVERLAY (Linux has no equivalent of Windows' Secure Desktop
-#     lock screen guaranteed to be present, so this window IS the enforced
-#     barrier: it stays on top and only closes on a real sober breath or a
-#     correct master password) ---
+# --- GUI LOCK OVERLAY. This is an app-level window, not a real OS session
+#     lock: it stays always-on-top and blocks interacting with anything
+#     underneath it, and only closes on a real sober breath or a correct
+#     master password. No real session lock (loginctl/LockWorkStation-style)
+#     is triggered - the fullscreen window itself is the whole mechanism. ---
 def run_lock_overlay(ser, baseline_val, debug):
     if not TKINTER_AVAILABLE:
         log("[WARNING] tkinter is not installed - falling back to console-only "
             "enforcement. Install it with your package manager, e.g. "
             "'sudo apt install python3-tk'.", "Yellow")
-        invoke_lock(debug, reason="Alcohol detected. (GUI unavailable - see console for status.)")
+        show_notification(
+            "AlcoLock",
+            "Alcohol detected, but the GUI overlay is unavailable (python3-tk "
+            "not installed). Check the console or alcolock.log for status.",
+            urgency="critical",
+        )
         start_sober_verification_loop(ser, baseline_val, debug)
         return
 
@@ -642,10 +519,6 @@ def run_lock_overlay(ser, baseline_val, debug):
             )
         finally:
             done_event.set()
-
-    # Best-effort real OS-level lock too (defense in depth, in case an actual
-    # locker daemon is present) - this window is what actually enforces things.
-    invoke_lock(debug, reason="Alcohol detected. A verification window has opened.")
 
     thread = threading.Thread(target=worker, daemon=True)
     thread.start()
@@ -725,6 +598,81 @@ def run_lock_overlay(ser, baseline_val, debug):
     thread.join(timeout=5)
 
 
+def run_waiting_overlay(message, check_ready=None, check_interval_sec=1, debug=False):
+    """
+    Simpler overlay for scenarios with no live sensor data to test against
+    (sensor disconnected, port failed to open): shows a static message and
+    only accepts the master password, optionally auto-closing via
+    check_ready() (e.g. polling for the sensor to reconnect).
+    """
+    if not TKINTER_AVAILABLE:
+        log("[WARNING] tkinter is not installed - falling back to console-only "
+            "enforcement.", "Yellow")
+        if check_ready:
+            while not check_ready():
+                time.sleep(check_interval_sec)
+        return
+
+    root = tk.Tk()
+    root.title("AlcoLock")
+    try:
+        root.attributes("-fullscreen", True)
+    except Exception:
+        root.geometry("900x500")
+    root.attributes("-topmost", True)
+    root.configure(bg="#1a1a1a")
+    root.protocol("WM_DELETE_WINDOW", lambda: None)
+
+    tk.Label(
+        root, text="🔒 AlcoLock", font=("Sans", 34, "bold"),
+        fg="#ff5555", bg="#1a1a1a",
+    ).pack(pady=(70, 15))
+
+    tk.Label(
+        root, text=message, font=("Sans", 18), fg="white", bg="#1a1a1a",
+        wraplength=800, justify="center",
+    ).pack(pady=20)
+
+    tk.Frame(root, height=2, bg="#444444").pack(fill="x", padx=200, pady=30)
+
+    tk.Label(
+        root, text="Enter the master password to override:",
+        font=("Sans", 12), fg="#cccccc", bg="#1a1a1a",
+    ).pack(pady=(0, 10))
+
+    pw_frame = tk.Frame(root, bg="#1a1a1a")
+    pw_frame.pack(pady=5)
+    pw_var = tk.StringVar()
+    pw_entry = tk.Entry(pw_frame, textvariable=pw_var, show="*", font=("Sans", 13), width=24)
+    pw_entry.pack(side="left", padx=(0, 10))
+
+    error_lbl = tk.Label(root, text="", font=("Sans", 11), fg="#ff5555", bg="#1a1a1a")
+
+    def try_unlock(_event=None):
+        if pw_var.get() == MASTER_PASSWORD:
+            root.quit()
+        else:
+            error_lbl.config(text="Incorrect password.")
+            error_lbl.pack(pady=(5, 0))
+            pw_var.set("")
+
+    tk.Button(pw_frame, text="Unlock", font=("Sans", 12), command=try_unlock).pack(side="left")
+    pw_entry.bind("<Return>", try_unlock)
+    pw_entry.focus_set()
+
+    def poll():
+        if check_ready and check_ready():
+            root.quit()
+            return
+        root.after(int(check_interval_sec * 1000), poll)
+
+    if check_ready:
+        root.after(int(check_interval_sec * 1000), poll)
+
+    root.mainloop()
+    root.destroy()
+
+
 EXAMPLES_TEXT = """
 examples:
   alco_lock.py
@@ -734,8 +682,9 @@ examples:
       Background monitoring mode (installed at login via systemd).
 
   alco_lock.py --mode Quiet --debug
-      Safe dry run: watch the sensor and simulated lock/unlock logs without
-      actually locking your session.
+      Skips autostart install and the -Cleanup password prompt; the overlay
+      itself still runs the same either way (it's an app window, not a real
+      session lock, so it's always safe to test).
 
   alco_lock.py --mode Quiet --port /dev/ttyACM0
       Force a specific device instead of autodetecting.
@@ -748,19 +697,19 @@ examples:
 def parse_args():
     parser = argparse.ArgumentParser(
         prog="alco_lock.py",
-        description="AlcoLock - breathalyzer-gated screen lock (Linux)",
+        description="AlcoLock - breathalyzer-gated action blocker (Linux)",
         epilog=EXAMPLES_TEXT,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--mode", choices=["Normal", "Quiet"], default="Normal",
-        help="Normal: lock once, verify, exit (default). "
+        help="Normal: show the overlay once, verify, exit (default). "
              "Quiet: run continuously in the background.",
     )
     parser.add_argument(
         "-d", "--debug", action="store_true",
-        help="Dry run - log actions instead of actually locking the "
-             "session or requiring a real password.",
+        help="Skips autostart install and the -Cleanup password prompt. "
+             "The overlay itself always runs normally.",
     )
     parser.add_argument(
         "--cleanup", "--disable-autostart", dest="cleanup", action="store_true",
@@ -794,13 +743,29 @@ def main():
     port_name = resolve_serial_port(args.port)
     log(f"Using port: {port_name}", "Green")
 
+    ser = None
     try:
         ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
     except Exception as e:
         log(f"Error opening serial port: {e}", "Red")
         if CURRENT_MODE == "Quiet":
-            invoke_lock(args.debug, reason="Could not open the sensor's serial port. Locking until it's available again.")
-        sys.exit(1)
+            def try_open():
+                nonlocal ser
+                try:
+                    ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
+                    return True
+                except Exception:
+                    return False
+            run_waiting_overlay(
+                "Could not open the sensor's serial port.\nReconnect the device, "
+                "or enter the master password to override.",
+                check_ready=try_open, check_interval_sec=2, debug=args.debug,
+            )
+        if ser is None:
+            # Either not in Quiet mode, or the person used the master-password
+            # override without ever reconnecting the sensor - nothing left to do.
+            log("No working sensor connection - exiting.", "Yellow")
+            sys.exit(1)
 
     try:
         global_baseline = initialize_baseline(ser)
@@ -826,19 +791,24 @@ def main():
 
                 except (serial.SerialException, OSError):
                     log("WARNING: SENSOR DISCONNECTED OR SERIAL CONNECTION LOST!", "Red")
-                    invoke_lock(args.debug, reason="Sensor disconnected. Locking until it reconnects.")
 
-                    while not ser.is_open:
-                        invoke_lock(args.debug, reason="Sensor disconnected. Reconnect the device to unlock.")
-                        time.sleep(1)
+                    def try_reconnect():
                         try:
                             ser.open()
                         except Exception:
                             pass
+                        return ser.is_open
 
-                    # Recalibrate clean air on reconnect
-                    global_baseline = initialize_baseline(ser)
-                    run_lock_overlay(ser, global_baseline, args.debug)
+                    run_waiting_overlay(
+                        "Sensor disconnected.\nReconnect the device to unlock, "
+                        "or enter the master password to override.",
+                        check_ready=try_reconnect, check_interval_sec=1, debug=args.debug,
+                    )
+
+                    if ser.is_open:
+                        # Recalibrate clean air on reconnect
+                        global_baseline = initialize_baseline(ser)
+                        run_lock_overlay(ser, global_baseline, args.debug)
 
                 time.sleep(2)
     finally:
