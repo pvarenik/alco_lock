@@ -77,17 +77,100 @@ Task Manager / `pkill`. That's intentional: this is a personal joke device,
 not something that should risk trapping you with no way out if it ever hits
 a bug.
 
-## Hardware
+## Hardware assembly
 
-- Arduino Uno or a compatible clone (tested with ATmega328 + CH340 USB-serial
-  chip).
-- MQ-3 alcohol gas sensor module, analog output wired to an analog input pin.
-- The board must stream numeric ADC readings, one integer per line, over
-  serial at 9600 baud (default `$baudRate`). Any simple sketch that reads the
-  analog pin and does `Serial.println(value)` in a loop is sufficient.
+Tested setup: **Arduino Uno R3 clone (ATmega328 + CH340 USB-serial chip)** +
+a standard 4-pin **MQ-3** breakout module.
 
-Sensor firmware itself is not included in this repo — this project covers the
-host-side (PC) logic only.
+### Bill of materials
+
+- Arduino Uno R3 or compatible clone
+- MQ-3 alcohol gas sensor module (the common breakout board with an onboard
+  LM393 comparator - has 4 pins: `VCC`, `GND`, `DO`, `AO`)
+- USB cable (A-to-B, or whatever your board's connector is)
+- 3 male-to-female jumper wires
+
+### Wiring
+
+Only 3 wires - the sensor's digital output (`DO`) isn't used, since we want
+continuous analog readings, not a fixed on/off threshold:
+
+| MQ-3 pin | Arduino Uno pin | Notes |
+|----------|-----------------|-------|
+| `VCC`    | `5V`            | **Must be 5V, not 3.3V** - the sensor's internal heater needs it to reach operating temperature. On a 3.3V-only board, readings will be low and unreliable. |
+| `GND`    | `GND`           | Any GND pin works. |
+| `AO`     | `A0`            | Analog output → analog input. Matches `$mq3Pin` / `MQ3_PIN` in the sketch. |
+| `DO`     | *(unused)*      | Leave disconnected. |
+
+```
+                 ┌─────────────────────┐
+                 │      MQ-3 module     │
+                 │  VCC  GND  DO   AO   │
+                 └───┬────┬────────┬────┘
+                     │    │        │
+                     │    │        │
+   Arduino Uno R3   5V   GND       A0
+     ┌──────────────┴────┴────────┴──────┐
+     │                                    │
+     │             (USB to PC)            │
+     └────────────────────────────────────┘
+```
+
+### Firmware
+
+A ready-to-flash sketch is included: **[`alco_sensor.ino`](./alco_sensor.ino)**.
+It just does `Serial.println(analogRead(A0))` every 500ms at 9600 baud -
+exactly the protocol both host scripts expect (one plain integer per line).
+
+**To flash it:**
+1. Install the [Arduino IDE](https://www.arduino.cc/en/software).
+2. Open `alco_sensor.ino`.
+3. `Tools → Board` → "Arduino Uno" (works fine for CH340 clones too).
+4. `Tools → Port` → select the port that appears when you plug the board in
+   (see the port-autodetection section below for how the host scripts find
+   this automatically).
+   - If the port doesn't show up in the IDE at all, you likely need the
+     **CH340 USB driver** - most genuine Uno R3 boards use an ATmega16u2 for
+     USB and don't need this, but cheap clones almost always use a CH340
+     chip that needs its own driver on Windows (usually auto-installs on
+     Linux). Search "CH340 driver" for your OS if the board isn't detected.
+5. Click **Upload**.
+6. Open `Tools → Serial Monitor`, set baud to **9600** - you should see a
+   stream of numbers (roughly 50-150 in clean air, depending on your unit).
+   If you see garbage characters, the baud rate doesn't match; if you see
+   nothing at all, double check the `AO`→`A0` and power wiring.
+7. Close the Serial Monitor before running `alco_lock.ps1`/`alco_lock.py` -
+   only one program can hold the serial port open at a time.
+
+### Common gotchas
+
+- **The sensor gets warm to the touch during normal operation.** That's the
+  onboard heater doing its job, not a fault.
+- **MQ-3 needs real warmup time to read consistently** - some datasheets
+  recommend a burn-in period on first-ever power-up, and several minutes of
+  warmup on every cold start after that, before readings stabilize. The
+  script's `$warmupSec`/`WARMUP_SEC` (10 seconds) is a placeholder for quick
+  testing - bump it up (a minute or more) once you're doing real runs, or
+  your calibrated baseline may drift for a while after each boot.
+- **Raw ADC values vary a lot between individual MQ-3 units** (sensitivity,
+  the specific load resistor value on your particular breakout board, supply
+  voltage tolerance). The `$threshold = 350` default is a starting point, not
+  a calibrated value - watch a few real clean-air and alcohol-breath readings
+  in the console first (run with `-Debug` on Windows, `--debug` on Linux) and
+  adjust `$threshold`/`THRESHOLD`, `$soberTime`/`SOBER_TIME`, and the
+  `rearmThreshold`/`minBlowingVal`/`deltaTrigger` values inside the
+  verification logic to match your actual hardware.
+- **Breathe onto the sensor's mesh opening directly and closely**, not from
+  across the room - MQ-3 modules are designed for close-range, direct
+  exposure. A short piece of tubing (even a straw) aimed at the sensor grille
+  gives more consistent, repeatable results than free-air breathing.
+- **One program at a time on the serial port.** If the Arduino IDE's Serial
+  Monitor, another terminal, or a leftover AlcoLock process still has the
+  port open, a new run will fail to connect (or fall into the "sensor not
+  found" blocking overlay) until it's released.
+
+Sensor firmware beyond the basic sketch above (smoothing, alternate pins,
+etc.) is up to you to adapt - this project covers the host-side (PC) logic.
 
 ## Requirements
 
