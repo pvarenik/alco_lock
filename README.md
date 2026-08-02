@@ -103,17 +103,24 @@ continuous analog readings, not a fixed on/off threshold:
 | `DO`     | *(unused)*      | Leave disconnected. |
 
 ```
-                 ┌─────────────────────┐
-                 │      MQ-3 module     │
-                 │  VCC  GND  DO   AO   │
-                 └───┬────┬────────┬────┘
-                     │    │        │
-                     │    │        │
-   Arduino Uno R3   5V   GND       A0
-     ┌──────────────┴────┴────────┴──────┐
-     │                                    │
-     │             (USB to PC)            │
-     └────────────────────────────────────┘
+                    MQ-3 alcohol sensor module               
+┌──────────────────────────────────────────────────────────────┐
+│                (4-pin analog breakout module)                │
+│                                                              │
+│         VCC             GND         DO          AO           │
+└──────────┬───────────────┬───────────X───────────┬───────────┘
+           │               │                       │             ◄── leave disconnected
+           │               │                       │           
+┌──────────┴───────────────┴───────────────────────┴───────────┐
+│         5V              GND                     A0           │
+│        POWER                                 ANALOG IN       │
+│                                                              │
+│                    Arduino Uno R3 (clone)                    │
+│                                                              │
+│                                                     [ USB ]  │
+└──────────────────────────────────────────────────────────────┘
+                                                          │
+                                                          └──► to your computer
 ```
 
 ### Firmware

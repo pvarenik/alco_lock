@@ -150,6 +150,7 @@ $portRetryDelaySec  = 2
 
 $baudRate   = 9600
 $threshold  = 350             # Alcohol trigger threshold
+$maxSaneBaseline = 150         # Reject/clamp calibration if the "clean air" baseline comes out this high or more
 $masterPass = "SuperSecret123" # HARDCODED MASTER PASSWORD
 $taskName   = "AlcoLockSystem" # Task name in Windows Task Scheduler
 $soberTime  = 5                # Seconds of continuous sober breath required
@@ -645,7 +646,11 @@ function Install-Self {
         $trigger = New-ScheduledTaskTrigger -AtLogOn
     }
     
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    # RestartCount/RestartInterval: if the process is killed (Task Manager,
+    # crash, etc.), Task Scheduler relaunches it instead of leaving the
+    # machine unmonitored until next logon - the Linux side already gets
+    # this for free from systemd's Restart=on-failure.
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -User "SYSTEM" -Force | Out-Null
 }
@@ -700,6 +705,11 @@ function Initialize-Baseline {
         foreach ($s in $stableSamples) { $sum += $s }
         $baselineVal = [math]::Round($sum / $stableSamples.Count)
         $lastRawVal = $samples[$samples.Count - 1]
+
+        if ($baselineVal -ge $maxSaneBaseline) {
+            Write-Log "WARNING: calibrated baseline ($baselineVal) is unusually high - the air may not have been clean during startup (e.g. alcohol was already present). Clamping to $maxSaneBaseline so detection doesn't get silently weakened." "Yellow"
+            $baselineVal = $maxSaneBaseline
+        }
     }
 
     Write-Log "Calibration complete! Clean air baseline value: $baselineVal" "Green"
@@ -728,6 +738,18 @@ function Connect-Sensor {
 
 # --- MAIN OPERATING LOOP ---
 Write-Log "Starting AlcoLock. Mode: $Mode." "Green"
+
+# Single-instance guard: if another copy already holds the serial port
+# (e.g. Quiet mode running continuously while the Normal-mode hourly trigger
+# also fires), a second instance would fail to open the port and could be
+# mistaken for "sensor not found" - refuse to fight over it instead.
+# (Mutex is released automatically by the OS when this process exits.)
+$createdNew = $false
+$instanceMutex = New-Object System.Threading.Mutex($true, "Global\AlcoLockSingleInstance", [ref]$createdNew)
+if (-not $createdNew) {
+    Write-Log "Another AlcoLock instance is already running - exiting to avoid fighting over the serial port." "Yellow"
+    exit
+}
 if ($Debug) { Write-Log "DEBUG MODE ACTIVE" "Yellow" }
 
 $serialPort = Connect-Sensor -override $Port

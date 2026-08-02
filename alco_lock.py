@@ -43,6 +43,7 @@ Requires: pyserial (pip install pyserial --break-system-packages)
 
 import argparse
 import datetime
+import fcntl
 import getpass
 import glob
 import os
@@ -76,6 +77,7 @@ PORT_RETRY_DELAY_SEC = 2
 
 BAUD_RATE = 9600
 THRESHOLD = 350               # Alcohol trigger threshold
+MAX_SANE_BASELINE = 150       # Reject/clamp calibration if the "clean air" baseline comes out this high or more
 MASTER_PASSWORD = "SuperSecret123"  # HARDCODED MASTER PASSWORD - change before real use
 SERVICE_NAME = "alcolock"     # systemd --user unit name
 SOBER_TIME = 5                # Seconds of continuous sober breath required
@@ -340,6 +342,12 @@ def initialize_baseline(ser):
         stable_samples = samples[half_index:]
         baseline_val = round(sum(stable_samples) / len(stable_samples))
         last_raw_val = samples[-1]
+
+        if baseline_val >= MAX_SANE_BASELINE:
+            log(f"WARNING: calibrated baseline ({baseline_val}) is unusually high - the air may not have "
+                f"been clean during startup (e.g. alcohol was already present). Clamping to "
+                f"{MAX_SANE_BASELINE} so detection doesn't get silently weakened.", "Yellow")
+            baseline_val = MAX_SANE_BASELINE
 
     log(f"Calibration complete! Clean air baseline value: {baseline_val}", "Green")
     return baseline_val, last_raw_val
@@ -739,6 +747,20 @@ def main():
     install_self(args.debug, CURRENT_MODE)
 
     log(f"Starting AlcoLock. Mode: {CURRENT_MODE}.", "Green")
+
+    # Single-instance guard: if another copy already holds the serial port
+    # (e.g. Quiet mode running continuously while a Normal-mode timer also
+    # fires), a second instance would fail to open the port and could be
+    # mistaken for "sensor not found" - refuse to fight over it instead.
+    # (The lock is released automatically by the OS when this process exits.)
+    lock_path = INSTALL_DIR / "alcolock.lock"
+    try:
+        INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        log("Another AlcoLock instance is already running - exiting to avoid fighting over the serial port.", "Yellow")
+        sys.exit(0)
     if args.debug:
         log("DEBUG MODE ACTIVE", "Yellow")
 
