@@ -736,6 +736,28 @@ function Connect-Sensor {
     }
 }
 
+# Single-attempt variant, safe to call from a WinForms Timer.Add_Tick handler
+# (i.e. from checkAction inside Show-WaitingOverlay). Connect-Sensor calls
+# Resolve-SerialPort, which internally retries with Start-Sleep for up to
+# ~12+ seconds - doing that on the UI thread freezes the whole window (no
+# keyboard input gets through, and Windows may treat it as "Not Responding"
+# and let Alt+F4 bypass the app's own close-cancellation entirely). The
+# Timer's own recurring tick already provides the retry cadence, so this
+# version tries exactly once and returns immediately either way.
+function Connect-SensorOnce {
+    param([string]$override = "")
+    try {
+        $portName = Find-SerialPort -override $override
+        if (-not $portName) { return $null }
+        $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, None, 8, One
+        $port.Open()
+        Write-Log "Using port: $portName" "Green"
+        return $port
+    } catch {
+        return $null
+    }
+}
+
 # --- MAIN OPERATING LOOP ---
 Write-Log "Starting AlcoLock. Mode: $Mode." "Green"
 
@@ -756,7 +778,7 @@ $serialPort = Connect-Sensor -override $Port
 
 if (-not $serialPort) {
     Show-WaitingOverlay -message "Sensor not found. Connect the device to continue, or enter the master password." -checkAction {
-        $script:serialPort = Connect-Sensor -override $Port
+        $script:serialPort = Connect-SensorOnce -override $Port
         return [bool]$script:serialPort
     }.GetNewClosure() -checkIntervalMs 2000
 }
@@ -796,7 +818,7 @@ if ($serialPort) {
                     Write-Log "WARNING: SENSOR DISCONNECTED OR COM PORT CONNECTION LOST!" "Red"
 
                     Show-WaitingOverlay -message "Sensor disconnected. Reconnect the device to unlock, or enter the master password." -checkAction {
-                        $script:serialPort = Connect-Sensor -override $Port
+                        $script:serialPort = Connect-SensorOnce -override $Port
                         return [bool]$script:serialPort
                     }.GetNewClosure() -checkIntervalMs 1000
 

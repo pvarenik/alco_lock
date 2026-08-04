@@ -766,11 +766,9 @@ def main():
 
     def connect_sensor(port_override):
         # Never raises - returns None on failure so the caller can route to
-        # the blocking overlay instead of crashing silently. Used both for
-        # the initial connection and every reconnect, so that turning the
-        # device off/unplugging it can never be used to cancel verification -
-        # a missing sensor always demands the master password or a real
-        # reconnect, the same as a mid-session disconnect does.
+        # the blocking overlay instead of crashing silently. Used only for
+        # the initial, one-time connection attempt (blocking here is fine -
+        # no GUI event loop is running yet).
         try:
             port_name = resolve_serial_port(port_override)
             new_ser = serial.Serial(port_name, BAUD_RATE, timeout=1)
@@ -780,12 +778,29 @@ def main():
             log(f"Could not connect to the sensor: {e}", "Red")
             return None
 
+    def connect_sensor_once(port_override):
+        # Single-attempt variant, safe to call from run_waiting_overlay's
+        # check_ready (invoked repeatedly via Tkinter's root.after on the
+        # GUI thread). connect_sensor() calls resolve_serial_port(), which
+        # internally retries with time.sleep() for up to ~12+ seconds -
+        # doing that on the GUI thread freezes the whole window (no
+        # keyboard input gets through, and the window manager may treat it
+        # as unresponsive). The overlay's own polling interval already
+        # provides the retry cadence, so this tries exactly once.
+        try:
+            port_name = find_serial_port(port_override)
+            if not port_name:
+                return None
+            return serial.Serial(port_name, BAUD_RATE, timeout=1)
+        except Exception:
+            return None
+
     ser = connect_sensor(args.port)
 
     if ser is None:
         def try_connect():
             nonlocal ser
-            ser = connect_sensor(args.port)
+            ser = connect_sensor_once(args.port)
             return ser is not None
 
         run_waiting_overlay(
@@ -831,7 +846,7 @@ def main():
 
                     def try_reconnect():
                         nonlocal ser
-                        ser = connect_sensor(args.port)
+                        ser = connect_sensor_once(args.port)
                         return ser is not None
 
                     run_waiting_overlay(
