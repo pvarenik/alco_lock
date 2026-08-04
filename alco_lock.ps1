@@ -450,6 +450,7 @@ function Show-VerificationOverlay {
     $timer.Interval = 500
 
     $timer.Add_Tick({
+      try {
         try {
             $line = $serialPort.ReadLine().Trim()
         } catch {
@@ -511,7 +512,7 @@ function Show-VerificationOverlay {
                 $timer.Stop()
                 $closeTimer = New-Object System.Windows.Forms.Timer
                 $closeTimer.Interval = 700
-                $closeTimer.Add_Tick({ $closeTimer.Stop(); $form.Close() }.GetNewClosure())
+                $closeTimer.Add_Tick({ try { $closeTimer.Stop(); $form.Close() } catch {} }.GetNewClosure())
                 $closeTimer.Start()
             }
         }
@@ -524,6 +525,9 @@ function Show-VerificationOverlay {
         }
 
         $state.PrevVal = $val
+      } catch {
+          Write-Log "Unexpected error in verification timer tick (ignored, will retry): $_" "Yellow"
+      }
     }.GetNewClosure())
 
     $form.Add_Shown({ $form.Activate(); $ui.PasswordBox.Focus() }.GetNewClosure())
@@ -576,7 +580,13 @@ function Show-WaitingOverlay {
         $timer = New-Object System.Windows.Forms.Timer
         $timer.Interval = $checkIntervalMs
         $timer.Add_Tick({
-            if (& $checkAction) {
+            $ready = $false
+            try {
+                $ready = & $checkAction
+            } catch {
+                Write-Log "checkAction failed this tick (will retry): $_" "Yellow"
+            }
+            if ($ready) {
                 $ctrl.AllowClose = $true
                 $timer.Stop()
                 $form.Close()

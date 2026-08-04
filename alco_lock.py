@@ -671,7 +671,13 @@ def run_waiting_overlay(message, check_ready=None, check_interval_sec=1, debug=F
     pw_entry.focus_set()
 
     def poll():
-        if check_ready and check_ready():
+        ready = False
+        if check_ready:
+            try:
+                ready = check_ready()
+            except Exception as e:
+                log(f"check_ready failed this tick (will retry): {e}", "Yellow")
+        if ready:
             root.quit()
             return
         root.after(int(check_interval_sec * 1000), poll)
