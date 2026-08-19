@@ -1,5 +1,6 @@
 # AlcoLock
 
+`powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1`
 A breathalyzer-gated action blocker. An MQ-3 alcohol sensor connected to an
 Arduino-compatible board feeds live readings over serial to a host-side
 script, which throws up a fullscreen, always-on-top window whenever the
@@ -7,7 +8,6 @@ reading exceeds a configured threshold — and only lets you back in after a
 genuine, fresh, sober breath is measured (or you type a master password).
 
 Two equivalent implementations are provided:
-
 - **`alco_lock.ps1`** — PowerShell, for Windows.
 - **`alco_lock.py`** — Python, for Linux (see [Linux (Python) version](#linux-python-version)).
 
