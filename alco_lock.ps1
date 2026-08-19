@@ -152,7 +152,7 @@ $baudRate   = 9600
 $threshold  = 350             # Alcohol trigger threshold
 $maxSaneBaseline = 150         # Reject/clamp calibration if the "clean air" baseline comes out this high or more
 $masterPass = "SuperSecret123" # HARDCODED MASTER PASSWORD
-$taskName   = "AlcoLockSystem" # Task name in Windows Task Scheduler
+$taskName   = "AlcoLockSystem_$Mode" # Task name in Windows Task Scheduler (per-mode, so Normal and Quiet don't clobber each other)
 $soberTime  = 5                # Seconds of continuous sober breath required
 $warmupSec  = 10               # Seconds of clean-air calibration at startup
 $installDir = "C:\ProgramData\AlcoLock"
@@ -326,56 +326,93 @@ function New-OverlayForm {
     $form.ControlBox = $false
     $form.ShowInTaskbar = $true
 
+    # Center content on the PRIMARY screen (the form itself still spans every
+    # monitor via VirtualScreen above, to block them all - but the readable
+    # content is centered on the main display, not pinned to a fixed pixel
+    # offset that only looked right in the corner of one specific resolution).
+    $primary = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $contentWidth = 760
+    $contentX = $primary.X + [int](($primary.Width - $contentWidth) / 2)
+    $topY = $primary.Y + [int]($primary.Height * 0.22)
+
     $titleLbl = New-Object System.Windows.Forms.Label
     $titleLbl.Text = "AlcoLock"
     $titleLbl.Font = New-Object System.Drawing.Font("Segoe UI", 28, [System.Drawing.FontStyle]::Bold)
     $titleLbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 85, 85)
-    $titleLbl.AutoSize = $true
-    $titleLbl.Location = New-Object System.Drawing.Point(60, 60)
+    $titleLbl.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $titleLbl.Size = New-Object System.Drawing.Size($contentWidth, 60)
+    $titleLbl.Location = New-Object System.Drawing.Point($contentX, $topY)
     $form.Controls.Add($titleLbl)
 
     $headlineLbl = New-Object System.Windows.Forms.Label
     $headlineLbl.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
     $headlineLbl.ForeColor = [System.Drawing.Color]::White
-    $headlineLbl.Size = New-Object System.Drawing.Size(760, 60)
-    $headlineLbl.Location = New-Object System.Drawing.Point(60, 150)
+    $headlineLbl.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $headlineLbl.Size = New-Object System.Drawing.Size($contentWidth, 60)
+    $headlineLbl.Location = New-Object System.Drawing.Point($contentX, ($topY + 90))
     $form.Controls.Add($headlineLbl)
 
     $detailLbl = New-Object System.Windows.Forms.Label
     $detailLbl.Font = New-Object System.Drawing.Font("Segoe UI", 11)
     $detailLbl.ForeColor = [System.Drawing.Color]::FromArgb(187, 187, 187)
-    $detailLbl.Size = New-Object System.Drawing.Size(760, 90)
-    $detailLbl.Location = New-Object System.Drawing.Point(60, 220)
+    $detailLbl.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $detailLbl.Size = New-Object System.Drawing.Size($contentWidth, 90)
+    $detailLbl.Location = New-Object System.Drawing.Point($contentX, ($topY + 160))
     $form.Controls.Add($detailLbl)
 
     $pwLabel = New-Object System.Windows.Forms.Label
     $pwLabel.Text = "Blow into the sensor to unlock, or enter the master password:"
     $pwLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10)
     $pwLabel.ForeColor = [System.Drawing.Color]::FromArgb(204, 204, 204)
-    $pwLabel.AutoSize = $true
-    $pwLabel.Location = New-Object System.Drawing.Point(60, 340)
+    $pwLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $pwLabel.Size = New-Object System.Drawing.Size($contentWidth, 26)
+    $pwLabel.Location = New-Object System.Drawing.Point($contentX, ($topY + 280))
     $form.Controls.Add($pwLabel)
+
+    # Password box + Unlock button, centered together as a pair
+    $pwBoxWidth = 250
+    $btnWidth = 100
+    $gap = 10
+    $pairWidth = $pwBoxWidth + $gap + $btnWidth
+    $pairX = $primary.X + [int](($primary.Width - $pairWidth) / 2)
+    $pairY = $topY + 312
 
     $pwBox = New-Object System.Windows.Forms.TextBox
     $pwBox.Font = New-Object System.Drawing.Font("Segoe UI", 11)
-    $pwBox.Size = New-Object System.Drawing.Size(250, 30)
-    $pwBox.Location = New-Object System.Drawing.Point(60, 370)
+    $pwBox.Size = New-Object System.Drawing.Size($pwBoxWidth, 30)
+    $pwBox.Location = New-Object System.Drawing.Point($pairX, $pairY)
+    $pwBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
     $pwBox.UseSystemPasswordChar = $true
     $form.Controls.Add($pwBox)
 
     $unlockBtn = New-Object System.Windows.Forms.Button
     $unlockBtn.Text = "Unlock"
     $unlockBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-    $unlockBtn.Size = New-Object System.Drawing.Size(100, 32)
-    $unlockBtn.Location = New-Object System.Drawing.Point(320, 369)
+    $unlockBtn.Size = New-Object System.Drawing.Size($btnWidth, 32)
+    $unlockBtn.Location = New-Object System.Drawing.Point(($pairX + $pwBoxWidth + $gap), ($pairY - 1))
     $form.Controls.Add($unlockBtn)
 
     $errorLbl = New-Object System.Windows.Forms.Label
     $errorLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $errorLbl.ForeColor = [System.Drawing.Color]::FromArgb(255, 85, 85)
-    $errorLbl.AutoSize = $true
-    $errorLbl.Location = New-Object System.Drawing.Point(60, 412)
+    $errorLbl.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $errorLbl.Size = New-Object System.Drawing.Size($contentWidth, 24)
+    $errorLbl.Location = New-Object System.Drawing.Point($contentX, ($pairY + 42))
     $form.Controls.Add($errorLbl)
+
+    # Close button - HIDDEN by default. Only ever shown after the person has
+    # already passed verification (see the success path in
+    # Show-VerificationOverlay), as a manual fallback in case the automatic
+    # close-on-success timer ever fails to fire. It must NEVER be shown while
+    # still locked/waiting - that would let anyone bypass the whole point of
+    # this tool with a single click, with no breath test or password needed.
+    $closeBtn = New-Object System.Windows.Forms.Button
+    $closeBtn.Text = "✕  Close"
+    $closeBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $closeBtn.Size = New-Object System.Drawing.Size(120, 34)
+    $closeBtn.Location = New-Object System.Drawing.Point(($primary.X + [int](($primary.Width - 120) / 2)), ($pairY + 70))
+    $closeBtn.Visible = $false
+    $form.Controls.Add($closeBtn)
 
     # Fight back a little if the user alt-tabs away - not real security (a
     # determined user can still kill the process via Task Manager), just
@@ -392,6 +429,7 @@ function New-OverlayForm {
         PasswordBox   = $pwBox
         UnlockButton  = $unlockBtn
         ErrorLabel    = $errorLbl
+        CloseButton   = $closeBtn
     }
 }
 
@@ -443,6 +481,13 @@ function Show-VerificationOverlay {
     $ui.PasswordBox.Add_KeyDown({
         param($s, $e)
         if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { & $tryUnlock }
+    }.GetNewClosure())
+
+    # Only ever becomes visible in the success path below - closing here is
+    # equivalent to it already being unlocked, not a way to skip verification.
+    $ui.CloseButton.Add_Click({
+        try { $state.CloseTimer.Stop() } catch {}
+        $form.Close()
     }.GetNewClosure())
 
     $serialPort.ReadTimeout = 400
@@ -507,13 +552,18 @@ function Show-VerificationOverlay {
             if ($state.ConsecutiveSoberSeconds -ge $soberTime) {
                 Write-Log "Successful breath test! Access restored." "Green"
                 $ui.Headline.Text = "Success!"
-                $ui.Detail.Text = "You are clear. Closing this window..."
+                $ui.Detail.Text = "You are clear. Closing automatically - or click Close below."
                 $state.AllowClose = $true
                 $timer.Stop()
-                $closeTimer = New-Object System.Windows.Forms.Timer
-                $closeTimer.Interval = 700
-                $closeTimer.Add_Tick({ try { $closeTimer.Stop(); $form.Close() } catch {} }.GetNewClosure())
-                $closeTimer.Start()
+                # Store the close-timer on $state (not a bare local variable) so
+                # it stays referenced/alive until it actually fires - a local-only
+                # Timer here risked being garbage-collected before its first tick,
+                # which is exactly why the window used to stay open after "Success!".
+                $state.CloseTimer = New-Object System.Windows.Forms.Timer
+                $state.CloseTimer.Interval = 700
+                $state.CloseTimer.Add_Tick({ try { $state.CloseTimer.Stop(); $form.Close() } catch {} }.GetNewClosure())
+                $state.CloseTimer.Start()
+                $ui.CloseButton.Visible = $true
             }
         }
         else {
@@ -580,6 +630,7 @@ function Show-WaitingOverlay {
         $timer = New-Object System.Windows.Forms.Timer
         $timer.Interval = $checkIntervalMs
         $timer.Add_Tick({
+          try {
             $ready = $false
             try {
                 $ready = & $checkAction
@@ -591,6 +642,9 @@ function Show-WaitingOverlay {
                 $timer.Stop()
                 $form.Close()
             }
+          } catch {
+              Write-Log "Unexpected error in waiting-overlay timer tick (ignored, will retry): $_" "Yellow"
+          }
         }.GetNewClosure())
         $timer.Start()
     }
@@ -608,7 +662,8 @@ function Remove-AlcoLock {
     if ($inputPass -eq $masterPass) {
         try {
             if ($env:OS -eq "Windows_NT") {
-                Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName "AlcoLockSystem_Normal" -Confirm:$false -ErrorAction SilentlyContinue
+                Unregister-ScheduledTask -TaskName "AlcoLockSystem_Quiet" -Confirm:$false -ErrorAction SilentlyContinue
                 if (Test-Path $installDir) { Remove-Item -Path $installDir -Recurse -Force -ErrorAction SilentlyContinue }
                 [System.Windows.Forms.MessageBox]::Show("AlcoLock has been completely removed from the system!", "Success", 0, 64)
             } else {
@@ -662,7 +717,20 @@ function Install-Self {
     # this for free from systemd's Restart=on-failure.
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -User "SYSTEM" -Force | Out-Null
+    # Run as the current interactive user (NOT SYSTEM) - a SYSTEM-context task
+    # runs in the non-interactive Session 0, where a WinForms window would be
+    # invisible/unusable to whoever's actually logged in. RunLevel Highest
+    # keeps the same elevated behavior as this initial interactive install.
+    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+
+    $verify = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($verify) {
+        Write-Log "Scheduled task '$taskName' registered (runs as $env:USERDOMAIN\$env:USERNAME, interactive)." "Green"
+    } else {
+        Write-Log "WARNING: Scheduled task registration did not appear to succeed - check manually with Get-ScheduledTask -TaskName '$taskName'." "Red"
+    }
 }
 
 # --- CLEANUP HANDLING ---
