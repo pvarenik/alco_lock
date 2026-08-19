@@ -1,48 +1,6 @@
 <#
 .SYNOPSIS
-    Breathalyzer-gated action blocker. Shows a fullscreen, always-on-top
-    overlay until a sober breath is confirmed by an MQ-3 alcohol sensor
-    connected via an Arduino-compatible board.
-
-.DESCRIPTION
-    Reads sensor readings from a serial port (Arduino/MQ-3), calibrates a
-    clean-air baseline on startup, and shows a fullscreen blocking window
-    whenever the reading exceeds the configured threshold. This is an
-    app-level overlay (not a real Windows session lock via LockWorkStation) -
-    it stays on top of everything, disables its own close button, and only
-    closes after a genuine fresh breath (detected as a sharp impulse, not
-    just a slowly-clearing residual reading) stays within the sober range
-    for several consecutive seconds, or the master password is entered.
-
-    Modes:
-      Normal - shows the overlay once immediately, verifies sobriety, then
-               exits (meant to be re-triggered hourly by Task Scheduler).
-      Quiet  - stays running in the background, silently monitoring the
-               sensor, and only shows the overlay when the threshold is
-               actually exceeded.
-
-.PARAMETER Mode
-    Normal or Quiet. See DESCRIPTION. Default: Normal.
-
-.PARAMETER Debug
-    Alias -d. Skips autostart installation and the password prompt used by
-    -Cleanup. The verification overlay itself still runs normally either way -
-    it's an app window, not a real OS lock, so it's always safe to test.
-
-.PARAMETER Cleanup
-    Removes the scheduled task and the installed copy in C:\ProgramData\AlcoLock
-    after confirming the master password.
-
-.PARAMETER DisableAutostart
-    Same effect as -Cleanup (kept as a separate, more descriptive alias).
-
-.PARAMETER Port
-    Manually specify the serial port, bypassing autodetection.
-    Example: -Port COM5 (Windows) or -Port /dev/ttyACM0 (Linux).
-
-.PARAMETER Help
-    Alias -h, -?. Prints this usage summary with examples and exits immediately,
-    without touching the sensor, autostart, or any locking logic.
+    Breathalyzer-gated action blocker with robust hardware disconnect handling.
 #>
 
 param(
@@ -62,7 +20,7 @@ param(
 )
 
 if ($Help) {
-    Write-Host "See Get-Help for details." -ForegroundColor Cyan
+    Write-Host "AlcoLock - Breathalyzer-gated action blocker" -ForegroundColor Cyan
     exit
 }
 
@@ -122,8 +80,11 @@ function Find-SerialPort {
             }
         } catch {}
 
-        $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
-        if ($ports.Count -ge 1) { return $ports[0] }
+        try {
+            $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
+            if ($ports.Count -ge 1) { return $ports[0] }
+        } catch {}
+        
         return $null
     }
     else {
@@ -133,17 +94,6 @@ function Find-SerialPort {
         if ($candidates.Count -ge 1) { return $candidates[0].FullName }
         return $null
     }
-}
-
-function Resolve-SerialPort {
-    param([string]$override = "")
-    for ($attempt = 1; $attempt -le $portRetryAttempts; $attempt++) {
-        $found = Find-SerialPort -override $override
-        if ($found) { return $found }
-        Write-Log "Port not found (attempt $attempt/$portRetryAttempts). Retrying..." "Yellow"
-        Start-Sleep -Seconds $portRetryDelaySec
-    }
-    throw "Could not find a serial port."
 }
 
 function Show-PasswordDialog {
@@ -308,6 +258,7 @@ function Show-VerificationOverlay {
         ConsecutiveSoberSeconds = 0
         IsBlowingStarted        = $false
         AllowClose              = $false
+        IsBusy                  = $false
     }
 
     $ui = New-OverlayForm
@@ -342,17 +293,21 @@ function Show-VerificationOverlay {
         $form.Close()
     }.GetNewClosure())
 
-    $serialPort.ReadTimeout = 400
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 500
 
     $timer.Add_Tick({
+      if ($state.IsBusy) { return }
+      $state.IsBusy = $true
+
       try {
+        if (-not $serialPort -or -not $serialPort.IsOpen -or $serialPort.BytesToRead -le 0) { return }
+
+        $line = ""
         try {
             $line = $serialPort.ReadLine().Trim()
-        } catch {
-            return
-        }
+        } catch { return }
+
         if ($line -notmatch '^\d+$') { return }
         [int]$val = $line
 
@@ -417,7 +372,10 @@ function Show-VerificationOverlay {
         }
 
         $state.PrevVal = $val
-      } catch { }
+      } catch { 
+      } finally {
+        $state.IsBusy = $false
+      }
     }.GetNewClosure())
 
     $form.Add_Shown({ $form.Activate(); $ui.PasswordBox.Focus() }.GetNewClosure())
@@ -434,7 +392,7 @@ function Show-WaitingOverlay {
         [int]$checkIntervalMs = 1000
     )
 
-    $ctrl = @{ AllowClose = $false }
+    $ctrl = @{ AllowClose = $false; IsBusy = $false }
     $ui = New-OverlayForm
     $form = $ui.Form
     $ui.Headline.Text = "AlcoLock"
@@ -466,6 +424,9 @@ function Show-WaitingOverlay {
         $timer = New-Object System.Windows.Forms.Timer
         $timer.Interval = $checkIntervalMs
         $timer.Add_Tick({
+          if ($ctrl.IsBusy) { return }
+          $ctrl.IsBusy = $true
+
           try {
             $ready = $false
             try { $ready = & $checkAction } catch { }
@@ -474,7 +435,10 @@ function Show-WaitingOverlay {
                 $timer.Stop()
                 $form.Close()
             }
-          } catch { }
+          } catch { 
+          } finally {
+            $ctrl.IsBusy = $false
+          }
         }.GetNewClosure())
         $timer.Start()
     }
@@ -562,7 +526,7 @@ function Initialize-Baseline {
         $ui.ErrorLabel.Visible = $false
         $ui.CloseButton.Visible = $false
 
-        $state = @{ AllowClose = $false }
+        $state = @{ AllowClose = $false; IsBusy = $false }
         $form.Add_FormClosing({
             param($s, $e)
             if (-not $state.AllowClose) { $e.Cancel = $true }
@@ -571,21 +535,30 @@ function Initialize-Baseline {
         $timer = New-Object System.Windows.Forms.Timer
         $timer.Interval = 500
         $timer.Add_Tick({
-            $elapsed = [Math]::Floor(([DateTime]::Now - $startTime).TotalSeconds)
-            $remain = $warmupSec - $elapsed
-            if ($remain -gt 0) {
-                $ui.Detail.Text = "Warming up and reading baseline... Please wait $remain seconds."
-                try {
-                    $line = $serialPort.ReadLine().Trim()
-                    if ($line -match '^\d+$') {
-                        [int]$val = $line
-                        if ($val -lt 500) { $samples.Add($val) }
+            if ($state.IsBusy) { return }
+            $state.IsBusy = $true
+
+            try {
+                $elapsed = [Math]::Floor(([DateTime]::Now - $startTime).TotalSeconds)
+                $remain = $warmupSec - $elapsed
+                if ($remain -gt 0) {
+                    $ui.Detail.Text = "Warming up and reading baseline... Please wait $remain seconds."
+                    if ($serialPort -and $serialPort.IsOpen -and $serialPort.BytesToRead -gt 0) {
+                        try {
+                            $line = $serialPort.ReadLine().Trim()
+                            if ($line -match '^\d+$') {
+                                [int]$val = $line
+                                if ($val -lt 500) { $samples.Add($val) }
+                            }
+                        } catch {}
                     }
-                } catch {}
-            } else {
-                $state.AllowClose = $true
-                $timer.Stop()
-                $form.Close()
+                } else {
+                    $state.AllowClose = $true
+                    $timer.Stop()
+                    $form.Close()
+                }
+            } finally {
+                $state.IsBusy = $false
             }
         }.GetNewClosure())
 
@@ -594,13 +567,15 @@ function Initialize-Baseline {
         if ($timer) { $timer.Stop(); $timer.Dispose() }
     } else {
         while (([DateTime]::Now - $startTime).TotalSeconds -lt $warmupSec) {
-            try {
-                $line = $serialPort.ReadLine().Trim()
-                if ($line -match '^\d+$') {
-                    [int]$val = $line
-                    if ($val -lt 500) { $samples.Add($val) }
-                }
-            } catch {}
+            if ($serialPort -and $serialPort.IsOpen -and $serialPort.BytesToRead -gt 0) {
+                try {
+                    $line = $serialPort.ReadLine().Trim()
+                    if ($line -match '^\d+$') {
+                        [int]$val = $line
+                        if ($val -lt 500) { $samples.Add($val) }
+                    }
+                } catch {}
+            }
             Start-Sleep -Milliseconds 500
         }
     }
@@ -628,31 +603,37 @@ function Initialize-Baseline {
     return [PSCustomObject]@{ Baseline = $baselineVal; LastReading = $lastRawVal }
 }
 
-function Connect-Sensor {
+function Connect-SensorOnce {
     param([string]$override = "")
+    $port = $null
     try {
-        $portName = Resolve-SerialPort -override $override
-        $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, None, 8, One
-        $port.ReadTimeout = 1000 # Защита от вечного зависания
+        $portName = Find-SerialPort -override $override
+        if (-not $portName) { return $null }
+        
+        $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, [System.IO.Ports.Parity]::None, 8, [System.IO.Ports.StopBits]::One
+        $port.ReadTimeout = 500
+        $port.WriteTimeout = 500
         $port.Open()
+        
+        # Задержка на время авто-сброса Arduino (DTR reset)
+        Start-Sleep -Milliseconds 300
+        $port.DiscardInBuffer()
+        
         return $port
     } catch {
+        if ($port -and $port.IsOpen) { try { $port.Close() } catch {} }
         return $null
     }
 }
 
-function Connect-SensorOnce {
+function Connect-Sensor {
     param([string]$override = "")
-    try {
-        $portName = Find-SerialPort -override $override
-        if (-not $portName) { return $null }
-        $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, None, 8, One
-        $port.ReadTimeout = 1000 # Защита от вечного зависания
-        $port.Open()
-        return $port
-    } catch {
-        return $null
+    for ($attempt = 1; $attempt -le $portRetryAttempts; $attempt++) {
+        $port = Connect-SensorOnce -override $override
+        if ($port) { return $port }
+        Start-Sleep -Seconds $portRetryDelaySec
     }
+    return $null
 }
 
 # --- MAIN OPERATING LOOP ---
@@ -660,23 +641,21 @@ $createdNew = $false
 $instanceMutex = New-Object System.Threading.Mutex($true, "Global\AlcoLockSingleInstance", [ref]$createdNew)
 if (-not $createdNew) { exit }
 
-$serialPort = Connect-Sensor -override $Port
+$serialPort = Connect-SensorOnce -override $Port
 $neededRecoveryUI = $false
 
 if (-not $serialPort) {
     $neededRecoveryUI = $true
     Show-WaitingOverlay -message "Sensor not found. Connect the device to continue, or enter the master password." -checkAction {
         $script:serialPort = Connect-SensorOnce -override $Port
-        return [bool]$script:serialPort
-    }.GetNewClosure() -checkIntervalMs 2000
+        return [bool]($script:serialPort -ne $null)
+    }.GetNewClosure() -checkIntervalMs 1500
     
-    # КРИТИЧЕСКИЙ ФИКС: подтягиваем заново подключенный порт в локальную область видимости
     $serialPort = $script:serialPort
 }
 
 if ($serialPort) {
     try {
-        # Если это Normal режим ИЛИ мы только что восстановились из ошибки - показываем UI калибровки
         $showCalibUI = ($Mode -eq "Normal" -or $neededRecoveryUI)
         $calibration = Initialize-Baseline -serialPort $serialPort -ShowUI $showCalibUI
         $globalBaseline = $calibration.Baseline
@@ -684,27 +663,27 @@ if ($serialPort) {
         if ($Mode -eq "Normal") {
             Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
         } else {
-            while ($serialPort.IsOpen) {
+            while ($serialPort -and $serialPort.IsOpen) {
                 try {
-                    $line = $serialPort.ReadLine().Trim()
-                    if ($line -match '^\d+$') {
-                        [int]$val = $line
-                        if ($val -gt $threshold) {
-                            Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
+                    if ($serialPort.BytesToRead -gt 0) {
+                        $line = $serialPort.ReadLine().Trim()
+                        if ($line -match '^\d+$') {
+                            [int]$val = $line
+                            if ($val -gt $threshold) {
+                                Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
+                            }
                         }
                     }
                 }
                 catch {
                     Show-WaitingOverlay -message "Sensor disconnected. Reconnect the device to unlock." -checkAction {
                         $script:serialPort = Connect-SensorOnce -override $Port
-                        return [bool]$script:serialPort
+                        return [bool]($script:serialPort -ne $null)
                     }.GetNewClosure() -checkIntervalMs 1000
 
-                    # ФИКС: обновляем переменную для while ($serialPort.IsOpen)
                     $serialPort = $script:serialPort
 
                     if ($serialPort -and $serialPort.IsOpen) {
-                        # Обязательно показываем UI при рекалибровке, чтобы не дать "бесплатных" 10 секунд
                         $calibration = Initialize-Baseline -serialPort $serialPort -ShowUI $true
                         $globalBaseline = $calibration.Baseline
                         if ($calibration.LastReading -gt $threshold) {
@@ -712,11 +691,11 @@ if ($serialPort) {
                         }
                     }
                 }
-                Start-Sleep -Milliseconds 500
+                Start-Sleep -Milliseconds 300
             }
         }
     }
     finally {
-        if ($serialPort -and $serialPort.IsOpen) { $serialPort.Close() }
+        if ($serialPort -and $serialPort.IsOpen) { try { $serialPort.Close() } catch {} }
     }
 }
