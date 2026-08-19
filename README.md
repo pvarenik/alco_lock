@@ -1,6 +1,24 @@
 # AlcoLock
 
-`powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1`
+```
+Сначала я бы запустил именно тесты:
+
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -SelfTest
+
+Ожидаемый результат — все тесты [PASS].
+
+Затем для первого реального запуска:
+
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1
+
+Для подробного режима:
+
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -DebugMode
+
+А удалить установленную задачу:
+
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -CleanUp
+```
 A breathalyzer-gated action blocker. An MQ-3 alcohol sensor connected to an
 Arduino-compatible board feeds live readings over serial to a host-side
 script, which throws up a fullscreen, always-on-top window whenever the

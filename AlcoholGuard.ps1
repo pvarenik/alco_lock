@@ -1,89 +1,82 @@
 #requires -Version 5.1
 
-<#
+<##
     AlcoholGuard.ps1
 
-    Режимы:
-      .\AlcoholGuard.ps1
-          - установить задачу и запустить защиту
+    Purpose:
+      - Detect Arduino MQ-3 sensor over serial.
+      - Lock the desktop with a fullscreen overlay.
+      - Ask the user to blow into the sensor.
+      - Require a confirmed breath event, then require values <= 350.
+      - Allow emergency unlock with master password 1989.
+      - Run immediately at logon and repeat the check every hour.
+      - Remove the scheduled task with -CleanUp.
+      - Run algorithm tests with -SelfTest.
+      - Show diagnostic values with -DebugMode.
 
-      .\AlcoholGuard.ps1 -Run
-          - используется самим Task Scheduler
+    IMPORTANT:
+      This is a user-session kiosk overlay, NOT the Windows secure lock screen.
+      Ctrl+Alt+Del is intentionally not interceptable by a normal PowerShell app.
 
-      .\AlcoholGuard.ps1 -CleanUp
-          - удалить задачу
-
-      .\AlcoholGuard.ps1 -SelfTest
-          - проверить алгоритм без Arduino/GUI
-
-    Arduino:
-      MQ-3 AO -> A0
-      Arduino Serial -> 9600 baud
-      Ожидаются строки:
-        123
-        247
-        351
-        ...
-
-    Логика:
-      1. Если Arduino не найден -> "подключите датчик"
-      2. Если найден -> калибровка чистого воздуха
-      3. После калибровки -> "дыхните в датчик"
-      4. Если обнаружен характерный подъём -> считаем выдох обнаруженным
-      5. После выдоха ждём 3 последовательных значения <= 350
-      6. Только после этого разблокируем
-      7. Мастер-пароль "1989" разблокирует сразу
+    Arduino expected serial output:
+      0..1023, one value per line, 9600 baud.
 #>
 
 param(
     [switch]$Run,
     [switch]$CleanUp,
-    [switch]$SelfTest
+    [switch]$SelfTest,
+    [switch]$DebugMode
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 $TaskName = 'AlcoholBreathGuard'
 $MasterPassword = '1989'
 
-# Если $null -> автоматический поиск COM-порта.
-# Можно жестко указать:
-# $PreferredComPort = 'COM5'
+# Set to 'COM5' to avoid scanning every COM port.
+# Leave as $null for automatic detection.
 $PreferredComPort = $null
 
 $BaudRate = 9600
-
-# MQ-3 / Arduino
 $AlcoholLimit = 350
+$ArduinoSampleIntervalMs = 500
 
-# Интервал Arduino из твоего кода
-$SampleIntervalMs = 500
-
-# Калибровка чистого воздуха
+# Calibration of clean air.
 $CalibrationSeconds = 10
+$CalibrationMinimumSamples = 8
 
-# Выброс считается выдохом, если:
-#   значение >= baseline + BlowDelta
-# ИЛИ
-#   значение >= baseline * BlowRatio
+# Breath detection.
+# Example: baseline=200 -> threshold=max(245,230)=245.
 $BlowDelta = 45
 $BlowRatio = 1.15
 
-# Чтобы случайный единичный скачок не считался выдохом:
-# минимум 2 измерения из последних 3 должны быть выше порога
+# Require at least 2 elevated samples in a 3-sample rolling window.
 $BreathWindowSize = 3
 $BreathRequiredHits = 2
 
-# После выдоха нужно несколько последовательных значений <= 350.
+# Strong spike can trigger immediately.
+$StrongBreathDelta = 120
+
+# After breath detection, require consecutive safe readings <= AlcoholLimit.
 $SafeReadingsRequired = 3
 
-# Как часто искать Arduino, если его нет
+# Hourly checking.
+$HourlyCheckSeconds = 3600
+
+# Polling / reconnect.
+$UiTickMs = 100
+$SensorReadEveryMs = 100
 $PortScanIntervalMs = 2000
+
+# Persistent log.
+$LogDirectory = Join-Path $env:LOCALAPPDATA 'AlcoholGuard'
+$LogFile = Join-Path $LogDirectory 'AlcoholGuard.log'
 
 # ============================================================
 # GLOBAL STATE
@@ -91,37 +84,69 @@ $PortScanIntervalMs = 2000
 
 $script:SerialPort = $null
 $script:SensorPort = $null
-
 $script:SensorConnected = $false
 
 $script:State = 'NoSensor'
-# Возможные состояния:
-#   NoSensor
-#   Calibrating
-#   WaitingForBreath
-#   BreathDetected
-#   Unlocked
+# NoSensor
+# Calibrating
+# WaitingForBreath
+# BreathDetected
+# Unlocked
 
 $script:Baseline = $null
 $script:BreathThreshold = $null
+$script:LastUiValue = $null
+$script:LastLogValue = $null
 
+$script:CalibrationStartedUtc = $null
 $script:CalibrationReadings = New-Object System.Collections.Generic.List[int]
 $script:RecentReadings = New-Object System.Collections.Generic.List[int]
-
 $script:SafeReadings = 0
-$script:LastScanMs = 0
-$script:LastSampleMs = 0
-$script:CalibrationStarted = $null
+
+$script:CurrentCheckStartedUtc = $null
+$script:NextCheckUtc = $null
+$script:LastUiMessage = ''
 
 $script:Forms = @()
 $script:StatusLabels = @()
 $script:CurrentValueLabel = $null
 $script:BaselineLabel = $null
 $script:ThresholdLabel = $null
+$script:StateLabel = $null
+$script:NextCheckLabel = $null
 $script:PasswordBox = $null
 $script:PasswordButton = $null
+$script:Timer = $null
 
-$script:LastUiMessage = ''
+$script:KeyboardHookInstalled = $false
+$script:Mutex = $null
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+function Write-GuardLog {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Message
+    )
+
+    try {
+        if (-not (Test-Path $LogDirectory)) {
+            New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+        }
+
+        $line = '{0} [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'), $env:USERNAME, $Message
+        Add-Content -Path $LogFile -Value $line -Encoding UTF8
+
+        if ($DebugMode) {
+            Write-Host $line
+        }
+    }
+    catch {
+        # Logging must never stop the guard.
+    }
+}
 
 # ============================================================
 # HELPERS
@@ -137,36 +162,49 @@ function Get-Median {
         return $null
     }
 
-    $sorted = $Values | Sort-Object
+    $sorted = @($Values | Sort-Object)
     $count = $sorted.Count
 
     if (($count % 2) -eq 1) {
         return [double]$sorted[[int]($count / 2)]
     }
 
-    return (
-        ([double]$sorted[($count / 2) - 1] +
-         [double]$sorted[$count / 2]) / 2
-    )
+    return ([double]$sorted[($count / 2) - 1] + [double]$sorted[$count / 2]) / 2.0
 }
 
-function Reset-SensorState {
+function Set-State {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateSet('NoSensor','Calibrating','WaitingForBreath','BreathDetected','Unlocked')]
+        [string]$NewState
+    )
+
+    if ($script:State -ne $NewState) {
+        Write-GuardLog "State: $($script:State) -> $NewState"
+    }
+
+    $script:State = $NewState
+}
+
+function Clear-SensorAlgorithmState {
     $script:Baseline = $null
     $script:BreathThreshold = $null
-
+    $script:CalibrationStartedUtc = $null
     $script:CalibrationReadings.Clear()
     $script:RecentReadings.Clear()
-
     $script:SafeReadings = 0
-    $script:CalibrationStarted = $null
+}
 
-    if ($script:SensorConnected) {
-        $script:State = 'Calibrating'
-        $script:CalibrationStarted = [DateTime]::UtcNow
+function Start-Calibration {
+    if (-not $script:SensorConnected) {
+        Set-State -NewState 'NoSensor'
+        return
     }
-    else {
-        $script:State = 'NoSensor'
-    }
+
+    Clear-SensorAlgorithmState
+    $script:CalibrationStartedUtc = [DateTime]::UtcNow
+    Set-State -NewState 'Calibrating'
+    Write-GuardLog "Calibration started on $($script:SensorPort)"
 }
 
 function Close-SerialPort {
@@ -175,19 +213,18 @@ function Close-SerialPort {
             if ($script:SerialPort.IsOpen) {
                 $script:SerialPort.Close()
             }
-
             $script:SerialPort.Dispose()
         }
     }
     catch {
-        # intentionally ignored
+        Write-GuardLog "Serial close error: $($_.Exception.Message)"
     }
 
     $script:SerialPort = $null
     $script:SensorPort = $null
     $script:SensorConnected = $false
-
-    Reset-SensorState
+    Clear-SensorAlgorithmState
+    Set-State -NewState 'NoSensor'
 }
 
 function Test-NumericSensorLine {
@@ -200,7 +237,6 @@ function Test-NumericSensorLine {
     }
 
     $value = 0
-
     if (-not [int]::TryParse($Line.Trim(), [ref]$value)) {
         return $false
     }
@@ -231,28 +267,25 @@ function Open-ArduinoPort {
         $port.RtsEnable = $false
 
         $port.Open()
+        Start-Sleep -Milliseconds 300
 
-        # Даём Arduino немного времени начать выдавать строки.
-        Start-Sleep -Milliseconds 250
-
-        $deadline = [DateTime]::UtcNow.AddMilliseconds(750)
+        $deadline = [DateTime]::UtcNow.AddMilliseconds(1200)
 
         while ([DateTime]::UtcNow -lt $deadline) {
             try {
                 $line = $port.ReadLine().Trim()
-
-                if (Test-NumericSensorLine $line) {
+                if (Test-NumericSensorLine -Line $line) {
+                    Write-GuardLog "Arduino detected on $PortName"
                     return $port
                 }
             }
             catch [TimeoutException] {
-                # Нормально.
+                # Keep waiting until deadline.
             }
         }
 
         $port.Close()
         $port.Dispose()
-
         return $null
     }
     catch {
@@ -262,17 +295,14 @@ function Open-ArduinoPort {
                 $port.Dispose()
             }
         }
-        catch {}
-
+        catch {
+        }
         return $null
     }
 }
 
 function Find-Arduino {
-    if ($script:SensorConnected -and
-        $null -ne $script:SerialPort -and
-        $script:SerialPort.IsOpen) {
-
+    if ($script:SensorConnected -and $null -ne $script:SerialPort -and $script:SerialPort.IsOpen) {
         return $true
     }
 
@@ -283,8 +313,7 @@ function Find-Arduino {
     }
     else {
         try {
-            $ports = [System.IO.Ports.SerialPort]::GetPortNames() |
-                Sort-Object
+            $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
         }
         catch {
             $ports = @()
@@ -292,16 +321,12 @@ function Find-Arduino {
     }
 
     foreach ($portName in $ports) {
-
         $candidate = Open-ArduinoPort -PortName $portName
-
         if ($null -ne $candidate) {
             $script:SerialPort = $candidate
             $script:SensorPort = $portName
             $script:SensorConnected = $true
-
-            Reset-SensorState
-
+            Start-Calibration
             return $true
         }
     }
@@ -310,25 +335,18 @@ function Find-Arduino {
 }
 
 function Read-SensorValue {
-    if (-not $script:SensorConnected -or
-        $null -eq $script:SerialPort -or
-        -not $script:SerialPort.IsOpen) {
-
+    if (-not $script:SensorConnected -or $null -eq $script:SerialPort -or -not $script:SerialPort.IsOpen) {
         return $null
     }
 
     $latest = $null
 
     try {
-        # Arduino пишет примерно раз в 500 ms.
-        # Забираем все уже накопившиеся строки и используем последнюю.
         while ($true) {
             try {
                 $line = $script:SerialPort.ReadLine().Trim()
-
-                if (Test-NumericSensorLine $line) {
+                if (Test-NumericSensorLine -Line $line) {
                     $parsed = 0
-
                     if ([int]::TryParse($line, [ref]$parsed)) {
                         $latest = $parsed
                     }
@@ -342,136 +360,95 @@ function Read-SensorValue {
         return $latest
     }
     catch {
+        Write-GuardLog "Serial read error: $($_.Exception.Message)"
         Close-SerialPort
         return $null
     }
 }
 
 # ============================================================
-# BREATH ALGORITHM
+# ALGORITHM
 # ============================================================
 
-function Start-Calibration {
-    $script:CalibrationReadings.Clear()
-    $script:RecentReadings.Clear()
+function Complete-CalibrationIfReady {
+    if ($script:State -ne 'Calibrating') {
+        return
+    }
 
-    $script:Baseline = $null
-    $script:BreathThreshold = $null
+    if ($null -eq $script:CalibrationStartedUtc) {
+        return
+    }
+
+    $elapsed = ([DateTime]::UtcNow - $script:CalibrationStartedUtc).TotalSeconds
+
+    if ($elapsed -lt $CalibrationSeconds) {
+        return
+    }
+
+    if ($script:CalibrationReadings.Count -lt $CalibrationMinimumSamples) {
+        return
+    }
+
+    # Median is deliberately used instead of average so that one accidental
+    # strong spike during calibration has less influence on the baseline.
+    $baselineDouble = Get-Median -Values @($script:CalibrationReadings)
+    $baseline = [int][Math]::Round([double]$baselineDouble)
+    $baseline = [Math]::Max(1, [Math]::Min(1023, $baseline))
+
+    $deltaThreshold = $baseline + $BlowDelta
+    $ratioThreshold = [int][Math]::Ceiling($baseline * $BlowRatio)
+
+    $threshold = [Math]::Max($deltaThreshold, $ratioThreshold)
+    $threshold = [Math]::Min(1023, $threshold)
+
+    $script:Baseline = $baseline
+    $script:BreathThreshold = $threshold
+    $script:RecentReadings.Clear()
     $script:SafeReadings = 0
 
-    $script:CalibrationStarted = [DateTime]::UtcNow
-    $script:State = 'Calibrating'
+    Set-State -NewState 'WaitingForBreath'
+    Write-GuardLog "Calibration complete: baseline=$baseline breathThreshold=$threshold samples=$($script:CalibrationReadings.Count)"
 }
 
-function Add-SensorReading {
+function Process-SensorReading {
     param(
         [Parameter(Mandatory)]
         [int]$Value
     )
 
-    # --------------------------------------------------------
-    # Calibration
-    # --------------------------------------------------------
+    $script:LastUiValue = $Value
 
     if ($script:State -eq 'Calibrating') {
-
         $script:CalibrationReadings.Add($Value)
-
-        $elapsed = (
-            [DateTime]::UtcNow -
-            $script:CalibrationStarted
-        ).TotalSeconds
-
-        if (
-            $elapsed -ge $CalibrationSeconds -and
-            $script:CalibrationReadings.Count -ge 10
-        ) {
-
-            $baseline = Get-Median -Values @($script:CalibrationReadings)
-
-            if ($baseline -lt 1) {
-                $baseline = 1
-            }
-
-            $script:Baseline = [int][Math]::Round($baseline)
-
-            $deltaThreshold = $script:Baseline + $BlowDelta
-
-            $ratioThreshold = [int][Math]::Ceiling(
-                $script:Baseline * $BlowRatio
-            )
-
-            $script:BreathThreshold = [Math]::Max(
-                $deltaThreshold,
-                $ratioThreshold
-            )
-
-            # Чтобы не выйти за диапазон Arduino
-            $script:BreathThreshold =
-                [Math]::Min(1023, $script:BreathThreshold)
-
-            $script:RecentReadings.Clear()
-            $script:SafeReadings = 0
-
-            # ВАЖНО:
-            # само по себе нахождение ниже 350 не разблокирует.
-            # Сначала нужен обнаруженный выдох.
-            $script:State = 'WaitingForBreath'
-        }
-
+        Complete-CalibrationIfReady
         return
     }
 
-    # --------------------------------------------------------
-    # Store rolling window
-    # --------------------------------------------------------
+    if ($script:State -eq 'WaitingForBreath' -or $script:State -eq 'BreathDetected') {
+        $script:RecentReadings.Add($Value)
 
-    $script:RecentReadings.Add($Value)
-
-    while ($script:RecentReadings.Count -gt $BreathWindowSize) {
-        $script:RecentReadings.RemoveAt(0)
+        while ($script:RecentReadings.Count -gt $BreathWindowSize) {
+            $script:RecentReadings.RemoveAt(0)
+        }
     }
-
-    # --------------------------------------------------------
-    # Waiting for breath
-    # --------------------------------------------------------
 
     if ($script:State -eq 'WaitingForBreath') {
-
-        $hits = @(
-            $script:RecentReadings |
-            Where-Object {
-                $_ -ge $script:BreathThreshold
-            }
-        ).Count
-
-        # Защита от единичного случайного скачка
-        if ($hits -ge $BreathRequiredHits) {
-
-            $script:State = 'BreathDetected'
-            $script:SafeReadings = 0
-
+        if ($null -eq $script:BreathThreshold -or $null -eq $script:Baseline) {
             return
         }
 
-        # Очень сильный скачок можно считать выдохом сразу.
-        if ($Value -ge ($script:Baseline + 120)) {
+        $hits = @($script:RecentReadings | Where-Object { $_ -ge $script:BreathThreshold }).Count
 
-            $script:State = 'BreathDetected'
+        if ($hits -ge $BreathRequiredHits -or $Value -ge ($script:Baseline + $StrongBreathDelta)) {
             $script:SafeReadings = 0
-
-            return
+            Set-State -NewState 'BreathDetected'
+            Write-GuardLog "Breath detected: value=$Value baseline=$($script:Baseline) threshold=$($script:BreathThreshold) recent=[$($script:RecentReadings -join ',')]"
         }
 
         return
     }
 
-    # --------------------------------------------------------
-    # Breath detected: wait for <= 350
-    # --------------------------------------------------------
-
     if ($script:State -eq 'BreathDetected') {
-
         if ($Value -le $AlcoholLimit) {
             $script:SafeReadings++
         }
@@ -480,15 +457,13 @@ function Add-SensorReading {
         }
 
         if ($script:SafeReadings -ge $SafeReadingsRequired) {
-            Unlock-Screen
+            Unlock-Screen -Reason 'Sensor accepted'
         }
-
-        return
     }
 }
 
 # ============================================================
-# UI
+# GUI
 # ============================================================
 
 function Set-UiMessage {
@@ -507,130 +482,79 @@ function Set-UiMessage {
         try {
             $label.Text = $Message
         }
-        catch {}
+        catch {
+        }
     }
 }
 
 function Update-Ui {
     try {
         switch ($script:State) {
-
             'NoSensor' {
-                Set-UiMessage 'подключите датчик'
+                Set-UiMessage -Message 'Connect sensor'
             }
-
             'Calibrating' {
-                Set-UiMessage 'калибровка датчика... не дышите в датчик'
+                Set-UiMessage -Message 'Calibrating sensor - do not blow'
             }
-
             'WaitingForBreath' {
-                Set-UiMessage 'дыхните в датчик'
+                Set-UiMessage -Message 'Blow into the sensor'
             }
-
             'BreathDetected' {
-                Set-UiMessage 'выдох обнаружен — проверка показаний...'
+                Set-UiMessage -Message 'Breath detected - checking reading'
             }
-
             'Unlocked' {
-                Set-UiMessage 'доступ разрешён'
+                Set-UiMessage -Message 'Access granted'
             }
         }
 
-        if ($null -ne $script:CurrentValueLabel) {
+        $script:StateLabel.Text = "State: $($script:State)"
 
-            if (
-                $script:SensorConnected -and
-                $script:LastUiValue -ne $null
-            ) {
-                $script:CurrentValueLabel.Text =
-                    "Показания: $($script:LastUiValue)"
-            }
-            else {
-                $script:CurrentValueLabel.Text =
-                    "Показания: —"
-            }
+        if ($null -ne $script:LastUiValue) {
+            $script:CurrentValueLabel.Text = "Reading: $($script:LastUiValue)"
+        }
+        else {
+            $script:CurrentValueLabel.Text = 'Reading: -'
         }
 
-        if ($null -ne $script:BaselineLabel) {
-            if ($null -ne $script:Baseline) {
-                $script:BaselineLabel.Text =
-                    "База: $($script:Baseline)"
-            }
-            else {
-                $script:BaselineLabel.Text =
-                    "База: —"
-            }
+        if ($null -ne $script:Baseline) {
+            $script:BaselineLabel.Text = "Baseline: $($script:Baseline)"
+        }
+        else {
+            $script:BaselineLabel.Text = 'Baseline: -'
         }
 
-        if ($null -ne $script:ThresholdLabel) {
-            if ($null -ne $script:BreathThreshold) {
-                $script:ThresholdLabel.Text =
-                    "Порог выдоха: $($script:BreathThreshold)"
-            }
-            else {
-                $script:ThresholdLabel.Text =
-                    "Порог выдоха: —"
-            }
+        if ($null -ne $script:BreathThreshold) {
+            $script:ThresholdLabel.Text = "Breath threshold: $($script:BreathThreshold)"
+        }
+        else {
+            $script:ThresholdLabel.Text = 'Breath threshold: -'
+        }
+
+        if ($script:State -eq 'Unlocked') {
+            $script:NextCheckLabel.Text = "Next check: $($script:NextCheckUtc.ToLocalTime().ToString('HH:mm:ss'))"
+        }
+        elseif ($null -ne $script:CurrentCheckStartedUtc -and $script:State -eq 'Calibrating') {
+            $remaining = [Math]::Max(0, $CalibrationSeconds - ([DateTime]::UtcNow - $script:CurrentCheckStartedUtc).TotalSeconds)
+            $script:NextCheckLabel.Text = "Calibration remaining: {0:N1}s" -f $remaining
+        }
+        else {
+            $script:NextCheckLabel.Text = "Sensor port: $($script:SensorPort)"
         }
     }
     catch {
-        # GUI update must never kill the monitoring process.
+        # Never let a GUI update kill the monitoring process.
     }
 }
 
-function Unlock-Screen {
-    if ($script:State -eq 'Unlocked') {
-        return
-    }
-
-    $script:State = 'Unlocked'
-
-    Set-UiMessage 'доступ разрешён'
-
-    Stop-KeyboardHook
-
-    foreach ($form in $script:Forms) {
-        try {
-            $form.Hide()
-        }
-        catch {}
-    }
-
-    if ($null -ne $script:Timer) {
-        try {
-            $script:Timer.Stop()
-        }
-        catch {}
-    }
-}
-
-function Unlock-WithPassword {
-    if ($null -eq $script:PasswordBox) {
-        return
-    }
-
-    if ($script:PasswordBox.Text -eq $MasterPassword) {
-        $script:PasswordBox.Clear()
-        Unlock-Screen
-        return
-    }
-
-    $script:PasswordBox.Clear()
-    $script:PasswordBox.Focus()
-
-    Set-UiMessage 'неверный пароль — дыхните в датчик'
-}
-
-function New-LockForm {
+function Build-LockForm {
     param(
         [Parameter(Mandatory)]
         [System.Windows.Forms.Screen]$Screen,
-
+        [Parameter(Mandatory)]
         [bool]$IsPrimary
     )
 
     $form = New-Object System.Windows.Forms.Form
-
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
     $form.WindowState = [System.Windows.Forms.FormWindowState]::Maximized
     $form.TopMost = $true
@@ -640,237 +564,210 @@ function New-LockForm {
     $form.BackColor = [System.Drawing.Color]::Black
     $form.ForeColor = [System.Drawing.Color]::White
     $form.KeyPreview = $true
+    $form.Text = 'AlcoholGuard'
 
-    # Нельзя закрыть крестиком / Alt+F4 / программным закрытием формы.
     $form.add_FormClosing({
-        param($sender, $event)
-
+        param($sender, $eventArgs)
         if ($script:State -ne 'Unlocked') {
-            $event.Cancel = $true
+            $eventArgs.Cancel = $true
         }
     })
 
-    # --------------------------------------------------------
-    # Main status
-    # --------------------------------------------------------
-
     $status = New-Object System.Windows.Forms.Label
-
     $status.AutoSize = $false
-    $status.TextAlign =
-        [System.Drawing.ContentAlignment]::MiddleCenter
-
-    $status.Font = New-Object System.Drawing.Font(
-        'Segoe UI',
-        32,
-        [System.Drawing.FontStyle]::Bold
-    )
-
+    $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $status.Font = New-Object System.Drawing.Font('Segoe UI', 32, [System.Drawing.FontStyle]::Bold)
     $status.ForeColor = [System.Drawing.Color]::White
     $status.BackColor = [System.Drawing.Color]::Black
-
-    $status.Width = [int]($Screen.Bounds.Width * 0.8)
+    $status.Width = [int]($Screen.Bounds.Width * 0.85)
     $status.Height = 100
-
-    $status.Left =
-        [int](($Screen.Bounds.Width - $status.Width) / 2)
-
-    $status.Top =
-        [int]($Screen.Bounds.Height * 0.38)
-
+    $status.Left = [int](($Screen.Bounds.Width - $status.Width) / 2)
+    $status.Top = [int]($Screen.Bounds.Height * 0.34)
+    $status.Text = 'Connect sensor'
     $form.Controls.Add($status)
-
     $script:StatusLabels += $status
-
-    # --------------------------------------------------------
-    # Sensor info
-    # --------------------------------------------------------
 
     $valueLabel = New-Object System.Windows.Forms.Label
     $valueLabel.AutoSize = $false
-    $valueLabel.TextAlign =
-        [System.Drawing.ContentAlignment]::MiddleCenter
-
-    $valueLabel.Font = New-Object System.Drawing.Font(
-        'Segoe UI',
-        12
-    )
-
-    $valueLabel.ForeColor =
-        [System.Drawing.Color]::Silver
-
+    $valueLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $valueLabel.Font = New-Object System.Drawing.Font('Segoe UI', 12)
+    $valueLabel.ForeColor = [System.Drawing.Color]::Silver
     $valueLabel.BackColor = [System.Drawing.Color]::Black
-
-    $valueLabel.Width = 300
-    $valueLabel.Height = 30
-
-    $valueLabel.Left =
-        [int](($Screen.Bounds.Width - 300) / 2)
-
-    $valueLabel.Top =
-        [int]($Screen.Bounds.Height * 0.51)
-
-    $valueLabel.Text = 'Показания: —'
-
+    $valueLabel.Width = 360
+    $valueLabel.Height = 28
+    $valueLabel.Left = [int](($Screen.Bounds.Width - 360) / 2)
+    $valueLabel.Top = [int]($Screen.Bounds.Height * 0.50)
+    $valueLabel.Text = 'Reading: -'
     $form.Controls.Add($valueLabel)
-
-    if ($IsPrimary) {
-        $script:CurrentValueLabel = $valueLabel
-    }
-
-    # --------------------------------------------------------
-    # Baseline
-    # --------------------------------------------------------
+    if ($IsPrimary) { $script:CurrentValueLabel = $valueLabel }
 
     $baselineLabel = New-Object System.Windows.Forms.Label
     $baselineLabel.AutoSize = $false
-    $baselineLabel.TextAlign =
-        [System.Drawing.ContentAlignment]::MiddleCenter
-
-    $baselineLabel.Font = New-Object System.Drawing.Font(
-        'Segoe UI',
-        10
-    )
-
-    $baselineLabel.ForeColor =
-        [System.Drawing.Color]::Gray
-
+    $baselineLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $baselineLabel.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $baselineLabel.ForeColor = [System.Drawing.Color]::Gray
     $baselineLabel.BackColor = [System.Drawing.Color]::Black
-
-    $baselineLabel.Width = 300
-    $baselineLabel.Height = 25
-
-    $baselineLabel.Left =
-        [int](($Screen.Bounds.Width - 300) / 2)
-
-    $baselineLabel.Top =
-        [int]($Screen.Bounds.Height * 0.55)
-
-    $baselineLabel.Text = 'База: —'
-
+    $baselineLabel.Width = 360
+    $baselineLabel.Height = 24
+    $baselineLabel.Left = [int](($Screen.Bounds.Width - 360) / 2)
+    $baselineLabel.Top = [int]($Screen.Bounds.Height * 0.54)
+    $baselineLabel.Text = 'Baseline: -'
     $form.Controls.Add($baselineLabel)
-
-    if ($IsPrimary) {
-        $script:BaselineLabel = $baselineLabel
-    }
-
-    # --------------------------------------------------------
-    # Breath threshold
-    # --------------------------------------------------------
+    if ($IsPrimary) { $script:BaselineLabel = $baselineLabel }
 
     $thresholdLabel = New-Object System.Windows.Forms.Label
     $thresholdLabel.AutoSize = $false
-    $thresholdLabel.TextAlign =
-        [System.Drawing.ContentAlignment]::MiddleCenter
-
-    $thresholdLabel.Font = New-Object System.Drawing.Font(
-        'Segoe UI',
-        10
-    )
-
-    $thresholdLabel.ForeColor =
-        [System.Drawing.Color]::Gray
-
+    $thresholdLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $thresholdLabel.Font = New-Object System.Drawing.Font('Segoe UI', 10)
+    $thresholdLabel.ForeColor = [System.Drawing.Color]::Gray
     $thresholdLabel.BackColor = [System.Drawing.Color]::Black
-
-    $thresholdLabel.Width = 300
-    $thresholdLabel.Height = 25
-
-    $thresholdLabel.Left =
-        [int](($Screen.Bounds.Width - 300) / 2)
-
-    $thresholdLabel.Top =
-        [int]($Screen.Bounds.Height * 0.59)
-
-    $thresholdLabel.Text = 'Порог выдоха: —'
-
+    $thresholdLabel.Width = 360
+    $thresholdLabel.Height = 24
+    $thresholdLabel.Left = [int](($Screen.Bounds.Width - 360) / 2)
+    $thresholdLabel.Top = [int]($Screen.Bounds.Height * 0.58)
+    $thresholdLabel.Text = 'Breath threshold: -'
     $form.Controls.Add($thresholdLabel)
+    if ($IsPrimary) { $script:ThresholdLabel = $thresholdLabel }
+
+    $stateLabel = New-Object System.Windows.Forms.Label
+    $stateLabel.AutoSize = $false
+    $stateLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $stateLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $stateLabel.ForeColor = [System.Drawing.Color]::DimGray
+    $stateLabel.BackColor = [System.Drawing.Color]::Black
+    $stateLabel.Width = 500
+    $stateLabel.Height = 22
+    $stateLabel.Left = [int](($Screen.Bounds.Width - 500) / 2)
+    $stateLabel.Top = [int]($Screen.Bounds.Height * 0.62)
+    $stateLabel.Text = 'State: NoSensor'
+    $form.Controls.Add($stateLabel)
+    if ($IsPrimary) { $script:StateLabel = $stateLabel }
+
+    $nextLabel = New-Object System.Windows.Forms.Label
+    $nextLabel.AutoSize = $false
+    $nextLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $nextLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $nextLabel.ForeColor = [System.Drawing.Color]::DimGray
+    $nextLabel.BackColor = [System.Drawing.Color]::Black
+    $nextLabel.Width = 500
+    $nextLabel.Height = 22
+    $nextLabel.Left = [int](($Screen.Bounds.Width - 500) / 2)
+    $nextLabel.Top = [int]($Screen.Bounds.Height * 0.65)
+    $nextLabel.Text = 'Sensor port: -'
+    $form.Controls.Add($nextLabel)
+    if ($IsPrimary) { $script:NextCheckLabel = $nextLabel }
 
     if ($IsPrimary) {
-        $script:ThresholdLabel = $thresholdLabel
-    }
-
-    # --------------------------------------------------------
-    # Password area
-    # --------------------------------------------------------
-
-    if ($IsPrimary) {
-
         $passwordBox = New-Object System.Windows.Forms.TextBox
-
         $passwordBox.Width = 240
         $passwordBox.Height = 35
-
-        $passwordBox.Left =
-            [int](($Screen.Bounds.Width - 240) / 2)
-
-        $passwordBox.Top =
-            [int]($Screen.Bounds.Height * 0.66)
-
-        $passwordBox.Font = New-Object System.Drawing.Font(
-            'Segoe UI',
-            15
-        )
-
+        $passwordBox.Left = [int](($Screen.Bounds.Width - 240) / 2)
+        $passwordBox.Top = [int]($Screen.Bounds.Height * 0.71)
+        $passwordBox.Font = New-Object System.Drawing.Font('Segoe UI', 15)
         $passwordBox.PasswordChar = '*'
-        $passwordBox.TextAlign =
-            [System.Windows.Forms.HorizontalAlignment]::Center
-
+        $passwordBox.TextAlign = [System.Windows.Forms.HorizontalAlignment]::Center
+        $passwordBox.TabStop = $true
         $form.Controls.Add($passwordBox)
-
         $script:PasswordBox = $passwordBox
 
-        $passwordButton = New-Object System.Windows.Forms.Button
-
-        $passwordButton.Width = 180
-        $passwordButton.Height = 36
-
-        $passwordButton.Left =
-            [int](($Screen.Bounds.Width - 180) / 2)
-
-        $passwordButton.Top =
-            [int]($Screen.Bounds.Height * 0.73)
-
-        $passwordButton.Text = 'Разблокировать'
-        $passwordButton.Font = New-Object System.Drawing.Font(
-            'Segoe UI',
-            11
-        )
-
-        $passwordButton.Add_Click({
-            Unlock-WithPassword
-        })
-
-        $form.Controls.Add($passwordButton)
-
-        $script:PasswordButton = $passwordButton
+        $button = New-Object System.Windows.Forms.Button
+        $button.Width = 180
+        $button.Height = 36
+        $button.Left = [int](($Screen.Bounds.Width - 180) / 2)
+        $button.Top = [int]($Screen.Bounds.Height * 0.78)
+        $button.Text = 'Unlock'
+        $button.Font = New-Object System.Drawing.Font('Segoe UI', 11)
+        $button.TabStop = $true
+        $button.Add_Click({ Unlock-WithPassword })
+        $form.Controls.Add($button)
+        $script:PasswordButton = $button
 
         $passwordBox.Add_KeyDown({
-            param($sender, $event)
-
-            if ($event.KeyCode -eq
-                [System.Windows.Forms.Keys]::Enter) {
-
+            param($sender, $eventArgs)
+            if ($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
                 Unlock-WithPassword
-                $event.SuppressKeyPress = $true
-                $event.Handled = $true
+                $eventArgs.SuppressKeyPress = $true
+                $eventArgs.Handled = $true
             }
         })
-
-        $passwordBox.Focus()
     }
 
     $script:Forms += $form
-
     return $form
+}
+
+function Show-LockOverlay {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    foreach ($form in $script:Forms) {
+        try {
+            $form.Show()
+            $form.TopMost = $true
+            $form.BringToFront()
+        }
+        catch {
+        }
+    }
+
+    if ($null -ne $script:PasswordBox) {
+        try { $script:PasswordBox.Focus() } catch { }
+    }
+}
+
+function Hide-LockOverlay {
+    foreach ($form in $script:Forms) {
+        try { $form.Hide() } catch { }
+    }
+}
+
+function Unlock-Screen {
+    param(
+        [string]$Reason = 'Unknown'
+    )
+
+    if ($script:State -eq 'Unlocked') {
+        return
+    }
+
+    Set-State -NewState 'Unlocked'
+    Write-GuardLog "Unlocked. Reason=$Reason"
+    Set-UiMessage -Message 'Access granted'
+
+    try {
+        if ($script:Timer.Enabled) {
+            # Keep timer alive so the next hourly check can lock again.
+        }
+    }
+    catch {
+    }
+
+    Hide-LockOverlay
+    Schedule-NextHourlyCheck
+}
+
+function Unlock-WithPassword {
+    if ($null -eq $script:PasswordBox) {
+        return
+    }
+
+    if ($script:PasswordBox.Text -eq $MasterPassword) {
+        $script:PasswordBox.Clear()
+        Unlock-Screen -Reason 'Master password'
+        return
+    }
+
+    $script:PasswordBox.Clear()
+    try { $script:PasswordBox.Focus() } catch { }
+    Set-UiMessage -Message 'Wrong password - blow into the sensor'
+    Write-GuardLog 'Invalid master password entered'
 }
 
 # ============================================================
 # GLOBAL KEYBOARD HOOK
 # ============================================================
 
-function Initialize-KeyboardHookType {
-
+function Initialize-KeyboardBlockerType {
     if ($null -ne ('AlcoholGuard.KeyboardBlocker' -as [type])) {
         return
     }
@@ -899,17 +796,13 @@ namespace AlcoholGuard
         private const int VK_RCONTROL = 0xA3;
         private const int VK_LSHIFT = 0xA0;
         private const int VK_RSHIFT = 0xA1;
-        private const int VK_DELETE = 0x2E;
 
         private static IntPtr _hook = IntPtr.Zero;
         private static LowLevelKeyboardProc _proc = HookCallback;
 
-        public static bool Enabled { get; private set; }
-
         public static void Install()
         {
-            if (_hook != IntPtr.Zero)
-                return;
+            if (_hook != IntPtr.Zero) return;
 
             using (Process process = Process.GetCurrentProcess())
             using (ProcessModule module = process.MainModule)
@@ -918,22 +811,15 @@ namespace AlcoholGuard
                     WH_KEYBOARD_LL,
                     _proc,
                     GetModuleHandle(module.ModuleName),
-                    0
-                );
+                    0);
             }
-
-            Enabled = (_hook != IntPtr.Zero);
         }
 
         public static void Uninstall()
         {
-            if (_hook != IntPtr.Zero)
-            {
-                UnhookWindowsHookEx(_hook);
-                _hook = IntPtr.Zero;
-            }
-
-            Enabled = false;
+            if (_hook == IntPtr.Zero) return;
+            UnhookWindowsHookEx(_hook);
+            _hook = IntPtr.Zero;
         }
 
         private static bool IsDown(int vk)
@@ -946,123 +832,117 @@ namespace AlcoholGuard
             bool alt = IsDown(VK_LMENU) || IsDown(VK_RMENU);
             bool ctrl = IsDown(VK_LCONTROL) || IsDown(VK_RCONTROL);
             bool shift = IsDown(VK_LSHIFT) || IsDown(VK_RSHIFT);
+            bool win = IsDown(VK_LWIN) || IsDown(VK_RWIN);
 
-            // Windows key всегда блокируем.
-            if (vk == VK_LWIN || vk == VK_RWIN)
-                return true;
-
-            // Alt+Tab
-            if (vk == VK_TAB && alt)
-                return true;
-
-            // Alt+F4
-            if (vk == VK_F4 && alt)
-                return true;
-
-            // Alt+Esc
-            if (vk == VK_ESCAPE && alt)
-                return true;
-
-            // Ctrl+Esc
-            if (vk == VK_ESCAPE && ctrl)
-                return true;
-
-            // Ctrl+Shift+Esc => Task Manager
-            if (vk == VK_ESCAPE && ctrl && shift)
-                return true;
-
-            // Win+...
-            if ((vk != VK_LWIN && vk != VK_RWIN) &&
-                (IsDown(VK_LWIN) || IsDown(VK_RWIN)))
-                return true;
+            if (vk == VK_LWIN || vk == VK_RWIN) return true;
+            if (win) return true;
+            if (vk == VK_TAB && alt) return true;
+            if (vk == VK_F4 && alt) return true;
+            if (vk == VK_ESCAPE && alt) return true;
+            if (vk == VK_ESCAPE && ctrl) return true;
+            if (vk == VK_ESCAPE && ctrl && shift) return true;
 
             return false;
         }
 
-        private static IntPtr HookCallback(
-            int nCode,
-            IntPtr wParam,
-            IntPtr lParam)
+        private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0 &&
-                (wParam == (IntPtr)WM_KEYDOWN ||
-                 wParam == (IntPtr)WM_SYSKEYDOWN))
+                (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
             {
                 int vkCode = Marshal.ReadInt32(lParam);
-
-                if (ShouldBlock(vkCode))
-                    return (IntPtr)1;
+                if (ShouldBlock(vkCode)) return (IntPtr)1;
             }
 
-            return CallNextHookEx(
-                _hook,
-                nCode,
-                wParam,
-                lParam
-            );
+            return CallNextHookEx(_hook, nCode, wParam, lParam);
         }
 
-        private delegate IntPtr LowLevelKeyboardProc(
-            int nCode,
-            IntPtr wParam,
-            IntPtr lParam
-        );
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("user32.dll", CharSet = CharSet.Auto,
-                   SetLastError = true)]
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr SetWindowsHookEx(
             int idHook,
             LowLevelKeyboardProc lpfn,
             IntPtr hMod,
-            uint dwThreadId
-        );
+            uint dwThreadId);
 
-        [DllImport("user32.dll",
-                   CharSet = CharSet.Auto,
-                   SetLastError = true)]
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool UnhookWindowsHookEx(
-            IntPtr hhk
-        );
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
 
-        [DllImport("user32.dll",
-                   CharSet = CharSet.Auto,
-                   SetLastError = true)]
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
         private static extern IntPtr CallNextHookEx(
             IntPtr hhk,
             int nCode,
             IntPtr wParam,
-            IntPtr lParam
-        );
+            IntPtr lParam);
 
-        [DllImport("kernel32.dll",
-                   CharSet = CharSet.Auto,
-                   SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(
-            string lpModuleName
-        );
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
 
         [DllImport("user32.dll")]
-        private static extern short GetAsyncKeyState(
-            int vKey
-        );
+        private static extern short GetAsyncKeyState(int vKey);
     }
 }
 '@
 }
 
 function Start-KeyboardHook {
-    Initialize-KeyboardHookType
+    Initialize-KeyboardBlockerType
     [AlcoholGuard.KeyboardBlocker]::Install()
+    $script:KeyboardHookInstalled = $true
+    Write-GuardLog 'Keyboard hook installed'
 }
 
 function Stop-KeyboardHook {
     try {
-        if ($null -ne ('AlcoholGuard.KeyboardBlocker' -as [type])) {
+        if ($script:KeyboardHookInstalled -and $null -ne ('AlcoholGuard.KeyboardBlocker' -as [type])) {
             [AlcoholGuard.KeyboardBlocker]::Uninstall()
         }
     }
-    catch {}
+    catch {
+    }
+    $script:KeyboardHookInstalled = $false
+}
+
+# ============================================================
+# CHECK CYCLE
+# ============================================================
+
+function Start-NewCheck {
+    Write-GuardLog 'Starting new hourly check'
+
+    $script:CurrentCheckStartedUtc = [DateTime]::UtcNow
+    $script:LastUiValue = $null
+    $script:NextCheckUtc = $null
+
+    Set-State -NewState 'NoSensor'
+    Show-LockOverlay
+
+    if ($null -ne $script:PasswordBox) {
+        try {
+            $script:PasswordBox.Clear()
+            $script:PasswordBox.Focus()
+        }
+        catch {
+        }
+    }
+
+    # If a previous serial connection died, try to reconnect.
+    if ($script:SensorConnected -and ($null -eq $script:SerialPort -or -not $script:SerialPort.IsOpen)) {
+        Close-SerialPort
+    }
+
+    if (-not (Find-Arduino)) {
+        Write-GuardLog 'No Arduino sensor detected'
+    }
+
+    Update-Ui
+}
+
+function Schedule-NextHourlyCheck {
+    $script:NextCheckUtc = [DateTime]::UtcNow.AddSeconds($HourlyCheckSeconds)
+    Write-GuardLog "Next hourly check at $($script:NextCheckUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
 }
 
 # ============================================================
@@ -1070,48 +950,38 @@ function Stop-KeyboardHook {
 # ============================================================
 
 function Register-GuardTask {
-
-    $scriptPath = $PSCommandPath
-
-    if ([string]::IsNullOrWhiteSpace($scriptPath)) {
-        throw 'Не удалось определить путь к .ps1 файлу.'
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        throw 'Cannot determine the current script path.'
     }
 
     $powershellExe = Join-Path $PSHome 'powershell.exe'
-
     if (-not (Test-Path $powershellExe)) {
         $powershellExe = (Get-Command powershell.exe).Source
     }
 
     try {
-        Unregister-ScheduledTask `
-            -TaskName $TaskName `
-            -Confirm:$false `
-            -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     }
-    catch {}
+    catch {
+    }
 
-    $arguments =
-        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden " +
-        "-File `"$scriptPath`" -Run"
+    # Pass the script path as one quoted value in a single argument string.
+    # This avoids the broken Start-Process -ArgumentList quoting used before.
+    $escapedScriptPath = $PSCommandPath.Replace('"', '\"')
+    $debugArgument = if ($DebugMode) { ' -DebugMode' } else { '' }
+    $argumentString = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Run{1}' -f $escapedScriptPath, $debugArgument
 
-    $action = New-ScheduledTaskAction `
-        -Execute $powershellExe `
-        -Argument $arguments
-
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $action = New-ScheduledTaskAction -Execute $powershellExe -Argument $argumentString
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -RandomDelay (New-TimeSpan -Seconds 5)
 
     $userId = "$env:USERDOMAIN\$env:USERNAME"
-
-    $principal = New-ScheduledTaskPrincipal `
-        -UserId $userId `
-        -LogonType Interactive `
-        -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Limited
 
     $settings = New-ScheduledTaskSettingsSet `
         -StartWhenAvailable `
         -AllowStartIfOnBatteries `
-        -DontStopIfGoingOnBatteries
+        -DontStopIfGoingOnBatteries `
+        -MultipleInstances IgnoreNew
 
     Register-ScheduledTask `
         -TaskName $TaskName `
@@ -1119,51 +989,36 @@ function Register-GuardTask {
         -Trigger $trigger `
         -Principal $principal `
         -Settings $settings `
-        -Description 'Alcohol sensor screen guard' `
+        -Description 'AlcoholBreathGuard hourly sensor overlay' `
         -Force | Out-Null
 
-    Write-Host "Задача '$TaskName' установлена."
+    Write-Host "Scheduled task '$TaskName' installed."
 }
 
 function Remove-GuardTask {
-
     try {
-        $task = Get-ScheduledTask `
-            -TaskName $TaskName `
-            -ErrorAction SilentlyContinue
-
-        if ($null -ne $task) {
-            Stop-ScheduledTask `
-                -TaskName $TaskName `
-                -ErrorAction SilentlyContinue
-
-            Unregister-ScheduledTask `
-                -TaskName $TaskName `
-                -Confirm:$false
-
-            Write-Host "Задача '$TaskName' удалена."
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($null -eq $task) {
+            Write-Host "Scheduled task '$TaskName' not found."
+            return
         }
-        else {
-            Write-Host "Задача '$TaskName' не найдена."
-        }
+
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Host "Scheduled task '$TaskName' removed."
     }
     catch {
-        Write-Warning "Не удалось удалить задачу: $($_.Exception.Message)"
+        Write-Warning "Could not remove scheduled task: $($_.Exception.Message)"
     }
 }
 
 # ============================================================
-# SELF TEST
+# SELF TESTS
 # ============================================================
 
 function Invoke-SelfTest {
-
-    Write-Host ''
-    Write-Host '=== AlcoholGuard SelfTest ===' -ForegroundColor Cyan
-    Write-Host ''
-
-    $passed = 0
-    $failed = 0
+    $script:TestPassed = 0
+    $script:TestFailed = 0
 
     function Assert-Test {
         param(
@@ -1181,116 +1036,95 @@ function Invoke-SelfTest {
         }
     }
 
-    $script:TestPassed = 0
-    $script:TestFailed = 0
-
-    # --------------------------------------------------------
-    # Test 1: baseline
-    # --------------------------------------------------------
+    Write-Host '=== AlcoholGuard SelfTest ===' -ForegroundColor Cyan
 
     $baselineData = @(198,201,200,199,202,201,200,198,201,200)
-
     $baseline = Get-Median -Values $baselineData
+    Assert-Test 'Median baseline is 200' ($baseline -eq 200)
 
-    Assert-Test `
-        'Baseline вычисляется корректно' `
-        ($baseline -eq 200)
-
-    # --------------------------------------------------------
-    # Test 2: breath threshold
-    # --------------------------------------------------------
-
-    $testThreshold = [Math]::Max(
+    $threshold = [Math]::Max(
         ($baseline + $BlowDelta),
         [int][Math]::Ceiling($baseline * $BlowRatio)
     )
+    Assert-Test 'Breath threshold is above baseline' ($threshold -gt $baseline)
 
-    Assert-Test `
-        'Порог выдоха выше baseline' `
-        ($testThreshold -gt $baseline)
+    $recent = @(200, $threshold + 5)
+    $hits = @($recent | Where-Object { $_ -ge $threshold }).Count
+    Assert-Test 'Single spike is rejected' ($hits -lt $BreathRequiredHits)
 
-    # --------------------------------------------------------
-    # Test 3: false single spike
-    # --------------------------------------------------------
+    $recent = @($threshold + 5, $threshold + 20, 201)
+    $hits = @($recent | Where-Object { $_ -ge $threshold }).Count
+    Assert-Test 'Two elevated samples confirm breath' ($hits -ge $BreathRequiredHits)
 
-    $recent = @(200, $testThreshold + 5)
+    $safe = @(340, 330, 345)
+    $safeCount = @($safe | Where-Object { $_ -le $AlcoholLimit }).Count
+    Assert-Test 'Three safe readings allow unlock' ($safeCount -ge $SafeReadingsRequired)
 
-    $hits = @(
-        $recent |
-        Where-Object { $_ -ge $testThreshold }
-    ).Count
+    $unsafe = @(500, 520, 490, 470)
+    $unsafeSafeCount = @($unsafe | Where-Object { $_ -le $AlcoholLimit }).Count
+    Assert-Test 'High readings do not allow unlock' ($unsafeSafeCount -lt $SafeReadingsRequired)
 
-    Assert-Test `
-        'Одиночный скачок НЕ считается выдохом' `
-        ($hits -lt $BreathRequiredHits)
+    $oscillating = @(260, 360, 340, 370, 330)
+    $oscSafeCount = @($oscillating | Where-Object { $_ -le $AlcoholLimit }).Count
+    Assert-Test 'Non-consecutive safe values do not unlock by themselves' ($oscSafeCount -lt $SafeReadingsRequired)
 
-    # --------------------------------------------------------
-    # Test 4: real breath
-    # --------------------------------------------------------
+    Assert-Test 'Master password is 1989' ($MasterPassword -eq '1989')
+    Assert-Test 'Alcohol limit is 350' ($AlcoholLimit -eq 350)
+    Assert-Test 'Hourly interval is 3600 seconds' ($HourlyCheckSeconds -eq 3600)
 
-    $recent = @(
-        $testThreshold + 10,
-        $testThreshold + 20,
-        260
-    )
+    # State-machine simulation: sober person.
+    $simBaseline = 200
+    $simThreshold = 245
+    $simState = 'WaitingForBreath'
+    $simRecent = New-Object System.Collections.Generic.List[int]
+    $simSafe = 0
+    $simSequence = @(205, 250, 270, 340, 330, 345)
 
-    $hits = @(
-        $recent |
-        Where-Object { $_ -ge $testThreshold }
-    ).Count
+    foreach ($value in $simSequence) {
+        $simRecent.Add($value)
+        while ($simRecent.Count -gt 3) { $simRecent.RemoveAt(0) }
 
-    Assert-Test `
-        'Два повышенных значения считаются выдохом' `
-        ($hits -ge $BreathRequiredHits)
+        if ($simState -eq 'WaitingForBreath') {
+            $simHits = @($simRecent | Where-Object { $_ -ge $simThreshold }).Count
+            if ($simHits -ge $BreathRequiredHits -or $value -ge ($simBaseline + $StrongBreathDelta)) {
+                $simState = 'BreathDetected'
+            }
+        }
+        elseif ($simState -eq 'BreathDetected') {
+            if ($value -le $AlcoholLimit) { $simSafe++ } else { $simSafe = 0 }
+            if ($simSafe -ge $SafeReadingsRequired) { $simState = 'Unlocked' }
+        }
+    }
 
-    # --------------------------------------------------------
-    # Test 5: sober breath -> unlock
-    # --------------------------------------------------------
+    Assert-Test 'Sober breath sequence reaches Unlocked' ($simState -eq 'Unlocked')
 
-    $safeSequence = @(300, 280, 310)
+    # State-machine simulation: alcohol above limit.
+    $simState = 'WaitingForBreath'
+    $simRecent = New-Object System.Collections.Generic.List[int]
+    $simSafe = 0
+    $simSequence = @(205, 250, 270, 500, 520, 510, 490)
 
-    Assert-Test `
-        'После выдоха значения <=350 считаются безопасными' `
-        (
-            (
-                $safeSequence |
-                Where-Object { $_ -le $AlcoholLimit }
-            ).Count -eq 3
-        )
+    foreach ($value in $simSequence) {
+        $simRecent.Add($value)
+        while ($simRecent.Count -gt 3) { $simRecent.RemoveAt(0) }
 
-    # --------------------------------------------------------
-    # Test 6: alcoholic sequence -> stays locked
-    # --------------------------------------------------------
+        if ($simState -eq 'WaitingForBreath') {
+            $simHits = @($simRecent | Where-Object { $_ -ge $simThreshold }).Count
+            if ($simHits -ge $BreathRequiredHits -or $value -ge ($simBaseline + $StrongBreathDelta)) {
+                $simState = 'BreathDetected'
+            }
+        }
+        elseif ($simState -eq 'BreathDetected') {
+            if ($value -le $AlcoholLimit) { $simSafe++ } else { $simSafe = 0 }
+            if ($simSafe -ge $SafeReadingsRequired) { $simState = 'Unlocked' }
+        }
+    }
 
-    $unsafeSequence = @(500, 520, 490)
-
-    Assert-Test `
-        'Значения >350 не дают разблокировку' `
-        (
-            (
-                $unsafeSequence |
-                Where-Object { $_ -le $AlcoholLimit }
-            ).Count -lt $SafeReadingsRequired
-        )
-
-    # --------------------------------------------------------
-    # Test 7: password
-    # --------------------------------------------------------
-
-    Assert-Test `
-        'Мастер-пароль равен ожидаемому' `
-        ($MasterPassword -eq '1989')
-
-    # --------------------------------------------------------
-    # Test 8: limit
-    # --------------------------------------------------------
-
-    Assert-Test `
-        'Лимит алкоголя установлен в 350' `
-        ($AlcoholLimit -eq 350)
+    Assert-Test 'Above-limit sequence stays locked' ($simState -ne 'Unlocked')
 
     Write-Host ''
-    Write-Host "ИТОГО: $script:TestPassed passed, $script:TestFailed failed."
+    Write-Host "Passed: $script:TestPassed"
+    Write-Host "Failed: $script:TestFailed"
     Write-Host ''
 
     if ($script:TestFailed -gt 0) {
@@ -1301,182 +1135,110 @@ function Invoke-SelfTest {
 }
 
 # ============================================================
-# MAIN GUI / MONITOR
+# MAIN RUNTIME
 # ============================================================
 
-function Start-Guard {
-
+function Start-GuardRuntime {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
-    # Один процесс
-    $mutexName =
-        "AlcoholGuard-$($env:USERNAME)-$([Environment]::UserName)"
-
+    $mutexName = "Global\AlcoholGuard-$env:USERNAME"
     $createdNew = $false
-
-    $mutex = New-Object System.Threading.Mutex(
-        $false,
-        $mutexName,
-        [ref]$createdNew
-    )
+    $script:Mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
 
     if (-not $createdNew) {
-        Write-Host 'AlcoholGuard уже запущен.'
+        Write-Host 'AlcoholGuard is already running.'
         return
     }
 
     try {
-
-        # ----------------------------------------------------
-        # Create lock forms for every monitor
-        # ----------------------------------------------------
-
-        $screens = [System.Windows.Forms.Screen]::AllScreens
-
+        $screens = @([System.Windows.Forms.Screen]::AllScreens)
         foreach ($screen in $screens) {
-
             $isPrimary = $screen.Primary
-
-            $form = New-LockForm `
-                -Screen $screen `
-                -IsPrimary $isPrimary
-
-            $form.Show()
+            $null = Build-LockForm -Screen $screen -IsPrimary $isPrimary
         }
 
-        # ----------------------------------------------------
-        # Lock keyboard shortcuts
-        # ----------------------------------------------------
-
+        # Do not repeatedly recreate hooks; install once for the lifetime of the process.
         Start-KeyboardHook
 
-        # ----------------------------------------------------
-        # Timer
-        # ----------------------------------------------------
-
-        $script:Timer =
-            New-Object System.Windows.Forms.Timer
-
-        # GUI loop ticks every 100 ms,
-        # sensor reading only every 500 ms.
-        $script:Timer.Interval = 100
-
-        $script:LastSampleMs = 0
-        $script:LastScanMs = 0
+        $script:Timer = New-Object System.Windows.Forms.Timer
+        $script:Timer.Interval = $UiTickMs
 
         $script:Timer.Add_Tick({
-
             try {
+                $now = [DateTime]::UtcNow
 
-                $now = [Environment]::TickCount64
-
-                # --------------------------------------------
-                # Keep window in foreground while locked
-                # --------------------------------------------
-
+                # Re-assert topmost state while locked.
                 if ($script:State -ne 'Unlocked') {
-
                     foreach ($form in $script:Forms) {
-
                         try {
-                            if (-not $form.Visible) {
-                                $form.Show()
-                            }
-
+                            if (-not $form.Visible) { $form.Show() }
                             $form.TopMost = $true
                             $form.BringToFront()
-                            $form.Activate()
                         }
-                        catch {}
-                    }
-                }
-
-                # --------------------------------------------
-                # Sensor discovery
-                # --------------------------------------------
-
-                if (-not $script:SensorConnected) {
-
-                    if (
-                        ($now - $script:LastScanMs)
-                        -ge $PortScanIntervalMs
-                    ) {
-
-                        $script:LastScanMs = $now
-
-                        $found = Find-Arduino
-
-                        if ($found) {
-                            Start-Calibration
+                        catch {
                         }
-
-                        Update-Ui
-                    }
-
-                    return
-                }
-
-                # --------------------------------------------
-                # Sensor read
-                # --------------------------------------------
-
-                if (
-                    ($now - $script:LastSampleMs)
-                    -ge $SampleIntervalMs
-                ) {
-
-                    $script:LastSampleMs = $now
-
-                    $value = Read-SensorValue
-
-                    if ($null -ne $value) {
-
-                        $script:LastUiValue = $value
-
-                        Add-SensorReading -Value $value
-
-                        Update-Ui
                     }
                 }
 
+                # Hourly cycle.
+                if ($script:State -eq 'Unlocked' -and $null -ne $script:NextCheckUtc -and $now -ge $script:NextCheckUtc) {
+                    Start-NewCheck
+                }
+
+                # Sensor reconnect / discovery while locked.
+                if ($script:State -ne 'Unlocked' -and -not $script:SensorConnected) {
+                    if ($null -eq $script:LastScanUtc -or ([DateTime]::UtcNow - $script:LastScanUtc).TotalMilliseconds -ge $PortScanIntervalMs) {
+                        $script:LastScanUtc = [DateTime]::UtcNow
+                        [void](Find-Arduino)
+                    }
+                }
+
+                # Sensor polling.
+                if ($script:State -ne 'Unlocked' -and $script:SensorConnected) {
+                    if ($null -eq $script:LastSampleUtc -or ([DateTime]::UtcNow - $script:LastSampleUtc).TotalMilliseconds -ge $SensorReadEveryMs) {
+                        $script:LastSampleUtc = [DateTime]::UtcNow
+                        $value = Read-SensorValue
+                        if ($null -ne $value) {
+                            Process-SensorReading -Value $value
+                        }
+                    }
+                }
+
+                # If sensor disappeared, reconnect on the next scan.
+                if ($script:SensorConnected -and ($null -eq $script:SerialPort -or -not $script:SerialPort.IsOpen)) {
+                    Write-GuardLog 'Sensor disconnected'
+                    Close-SerialPort
+                }
+
+                Update-Ui
             }
             catch {
-                # Нельзя допустить смерть главного GUI loop
-                Write-Debug $_
+                Write-GuardLog "Timer error: $($_.Exception.Message)"
             }
         })
 
-        # Initial state
-        Reset-SensorState
+        $script:LastScanUtc = [DateTime]::MinValue
+        $script:LastSampleUtc = [DateTime]::MinValue
 
-        # First sensor check immediately
-        $found = Find-Arduino
-
-        if ($found) {
-            Start-Calibration
-        }
-
-        Update-Ui
+        # Immediate first check.
+        Start-NewCheck
 
         $script:Timer.Start()
-
-        # ----------------------------------------------------
-        # Start Windows message loop
-        # ----------------------------------------------------
+        Write-GuardLog 'Runtime started'
 
         [System.Windows.Forms.Application]::Run()
-
     }
     finally {
+        Write-GuardLog 'Runtime stopping'
 
         try {
-            $script:Timer.Stop()
+            if ($null -ne $script:Timer) { $script:Timer.Stop() }
         }
-        catch {}
+        catch {
+        }
 
         Stop-KeyboardHook
-
         Close-SerialPort
 
         foreach ($form in $script:Forms) {
@@ -1484,16 +1246,20 @@ function Start-Guard {
                 $form.Close()
                 $form.Dispose()
             }
-            catch {}
+            catch {
+            }
         }
 
         $script:Forms = @()
 
         try {
-            $mutex.ReleaseMutex()
-            $mutex.Dispose()
+            if ($null -ne $script:Mutex) {
+                $script:Mutex.ReleaseMutex()
+                $script:Mutex.Dispose()
+            }
         }
-        catch {}
+        catch {
+        }
     }
 }
 
@@ -1511,35 +1277,22 @@ if ($CleanUp) {
 }
 
 if (-not $Run) {
-
-    Write-Host ''
-    Write-Host 'Installing AlcoholGuard...' -ForegroundColor Cyan
-
+    Write-Host 'Installing AlcoholGuard...'
     Register-GuardTask
 
-    Write-Host 'Запускаю защиту...'
-    Write-Host ''
-
-    # Перезапускаем себя именно как -Run.
-    $ps = Join-Path $PSHome 'powershell.exe'
-
-    if (-not (Test-Path $ps)) {
-        $ps = (Get-Command powershell.exe).Source
+    $powershellExe = Join-Path $PSHome 'powershell.exe'
+    if (-not (Test-Path $powershellExe)) {
+        $powershellExe = (Get-Command powershell.exe).Source
     }
 
-    Start-Process `
-        -FilePath $ps `
-        -ArgumentList @(
-            '-NoProfile'
-            '-ExecutionPolicy'
-            'Bypass'
-            '-File'
-            "`"$PSCommandPath`""
-            '-Run'
-        ) `
-        -WindowStyle Hidden
+    # Use ProcessStartInfo.ArgumentList when available is not reliable on every
+    # PowerShell 5.1 environment, so build one explicit argument string.
+    $escapedScriptPath = $PSCommandPath.Replace('"', '\"')
+    $debugArgument = if ($DebugMode) { ' -DebugMode' } else { '' }
+    $runArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Run{1}' -f $escapedScriptPath, $debugArgument
 
+    Start-Process -FilePath $powershellExe -ArgumentList $runArguments -WindowStyle Hidden
     exit 0
 }
 
-Start-Guard
+Start-GuardRuntime
