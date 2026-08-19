@@ -67,25 +67,16 @@ function Find-SerialPort {
 
     if ($env:OS -eq "Windows_NT") {
         try {
-            $devices = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop |
-                Where-Object { $_.Name -match '\(COM\d+\)' }
-
-            $known = @($devices | Where-Object {
-                $_.Name -match 'Arduino' -or $_.Name -match 'CH340' -or $_.Name -match 'CH341' -or
-                $_.Name -match 'USB-SERIAL' -or $_.Name -match 'CP210' -or $_.Name -match 'FTDI'
-            })
-
-            if ($known.Count -ge 1 -and $known[0].Name -match '\((COM\d+)\)') {
-                return $matches[1]
-            }
-        } catch {}
-
-        try {
-            $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
-            if ($ports.Count -ge 1) { return $ports[0] }
-        } catch {}
-        
-        return $null
+            $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Select-Object -Unique | Sort-Object)
+            if ($ports.Count -eq 0) { return $null }
+            
+            # Фильтруем встроенный материнский COM1, если есть другие порты
+            $usbPorts = @($ports | Where-Object { $_ -ne "COM1" })
+            if ($usbPorts.Count -ge 1) { return $usbPorts[-1] }
+            return $ports[0]
+        } catch {
+            return $null
+        }
     }
     else {
         $candidates = @()
@@ -605,25 +596,27 @@ function Initialize-Baseline {
 
 function Connect-SensorOnce {
     param([string]$override = "")
-    $port = $null
-    try {
-        $portName = Find-SerialPort -override $override
-        if (-not $portName) { return $null }
-        
-        $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, [System.IO.Ports.Parity]::None, 8, [System.IO.Ports.StopBits]::One
-        $port.ReadTimeout = 500
-        $port.WriteTimeout = 500
-        $port.Open()
-        
-        # Задержка на время авто-сброса Arduino (DTR reset)
-        Start-Sleep -Milliseconds 300
-        $port.DiscardInBuffer()
-        
-        return $port
-    } catch {
-        if ($port -and $port.IsOpen) { try { $port.Close() } catch {} }
-        return $null
+    $portName = Find-SerialPort -override $override
+    if (-not $portName) { return $null }
+
+    # Повторные попытки открытия порта с паузой (учитывает время инициализации драйвера USB)
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        $port = $null
+        try {
+            $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, [System.IO.Ports.Parity]::None, 8, [System.IO.Ports.StopBits]::One
+            $port.ReadTimeout = 500
+            $port.WriteTimeout = 500
+            $port.Open()
+
+            Start-Sleep -Milliseconds 400
+            $port.DiscardInBuffer()
+            return $port
+        } catch {
+            if ($port -and $port.IsOpen) { try { $port.Close() } catch {} }
+            Start-Sleep -Milliseconds 300
+        }
     }
+    return $null
 }
 
 function Connect-Sensor {
@@ -649,7 +642,7 @@ if (-not $serialPort) {
     Show-WaitingOverlay -message "Sensor not found. Connect the device to continue, or enter the master password." -checkAction {
         $script:serialPort = Connect-SensorOnce -override $Port
         return [bool]($script:serialPort -ne $null)
-    }.GetNewClosure() -checkIntervalMs 1500
+    }.GetNewClosure() -checkIntervalMs 1000
     
     $serialPort = $script:serialPort
 }
