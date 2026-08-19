@@ -43,38 +43,6 @@
 .PARAMETER Help
     Alias -h, -?. Prints this usage summary with examples and exits immediately,
     without touching the sensor, autostart, or any locking logic.
-
-.EXAMPLE
-    .\alco_lock.ps1
-    Runs in Normal mode with autodetected port. Locks immediately, waits for a
-    sober breath, then exits.
-
-.EXAMPLE
-    .\alco_lock.ps1 -Mode Quiet
-    Runs continuously in the background, only locking when alcohol is detected.
-    This is the mode installed at logon by the scheduled task.
-
-.EXAMPLE
-    .\alco_lock.ps1 -Mode Quiet -Debug
-    Safe dry run: background monitoring with fake locking (logs only), useful
-    for testing sensor behavior and thresholds without locking your own session.
-
-.EXAMPLE
-    .\alco_lock.ps1 -Mode Quiet -Port COM5
-    Forces a specific COM port instead of relying on autodetection - useful when
-    multiple serial devices are connected at once.
-
-.EXAMPLE
-    .\alco_lock.ps1 -Cleanup
-    Prompts for the master password and, if correct, fully removes AlcoLock
-    (scheduled task + installed files) from the system.
-
-.EXAMPLE
-    .\alco_lock.ps1 -Help
-    Shows this same summary directly in the console, without invoking Get-Help.
-
-.NOTES
-    Full parameter reference: Get-Help .\alco_lock.ps1 -Full
 #>
 
 param(
@@ -87,7 +55,6 @@ param(
     [switch]$Cleanup,
     [switch]$DisableAutostart,
 
-    # Manual port override (takes priority over autodetection). Example: -Port COM5 or -Port /dev/ttyACM0
     [string]$Port = "",
 
     [Alias("h","?")]
@@ -95,66 +62,20 @@ param(
 )
 
 if ($Help) {
-    Write-Host @"
-
-AlcoLock - breathalyzer-based screen lock
-==========================================
-
-USAGE:
-  .\alco_lock.ps1 [-Mode Normal|Quiet] [-Debug] [-Port <name>] [-Cleanup] [-Help]
-
-PARAMETERS:
-  -Mode <Normal|Quiet>   Normal: lock once, verify, exit (default).
-                         Quiet: run continuously in the background.
-  -Debug (-d)            Skips autostart install and the -Cleanup password
-                         prompt. The overlay itself always runs normally.
-  -Port <name>           Force a specific serial port (e.g. COM5 or
-                         /dev/ttyACM0), skipping autodetection.
-  -Cleanup               Remove the scheduled task and installed files
-                         (asks for the master password first).
-  -DisableAutostart      Same as -Cleanup.
-  -Help (-h, -?)         Show this help and exit.
-
-EXAMPLES:
-  .\alco_lock.ps1
-      Normal mode, autodetected port.
-
-  .\alco_lock.ps1 -Mode Quiet
-      Background monitoring mode (what runs at logon via Task Scheduler).
-
-  .\alco_lock.ps1 -Mode Quiet -Debug
-      Safe dry run: watch the sensor and simulated lock/unlock logs without
-      actually locking your session.
-
-  .\alco_lock.ps1 -Mode Quiet -Port COM5
-      Force COM5 instead of autodetecting.
-
-  .\alco_lock.ps1 -Port /dev/ttyACM0 -Debug
-      Test on Linux against a specific device node.
-
-  .\alco_lock.ps1 -Cleanup
-      Fully uninstall (prompts for the master password).
-
-For the full parameter reference, run:
-  Get-Help .\alco_lock.ps1 -Full
-
-"@ -ForegroundColor Cyan
+    Write-Host "See Get-Help for details." -ForegroundColor Cyan
     exit
 }
 
 # ================= SETTINGS =================
-# Port is detected automatically (see Find-SerialPort below).
-# To set it manually, use the launch parameter: -Port COM5  or  -Port /dev/ttyACM0
-$portRetryAttempts = 6     # Port detection attempts at startup (useful for logon autostart)
+$portRetryAttempts = 6     
 $portRetryDelaySec  = 2
-
 $baudRate   = 9600
-$threshold  = 350             # Alcohol trigger threshold
-$maxSaneBaseline = 150         # Reject/clamp calibration if the "clean air" baseline comes out this high or more
-$masterPass = "SuperSecret123" # HARDCODED MASTER PASSWORD
-$taskName   = "AlcoLockSystem_$Mode" # Task name in Windows Task Scheduler (per-mode, so Normal and Quiet don't clobber each other)
-$soberTime  = 5                # Seconds of continuous sober breath required
-$warmupSec  = 10               # Seconds of clean-air calibration at startup
+$threshold  = 350             
+$maxSaneBaseline = 150         
+$masterPass = "SuperSecret123" 
+$taskName   = "AlcoLockSystem_$Mode" 
+$soberTime  = 5                
+$warmupSec  = 10               
 $installDir = "C:\ProgramData\AlcoLock"
 # =============================================
 
@@ -164,8 +85,6 @@ if ($env:OS -eq "Windows_NT") {
     Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
 }
 
-# --- DEBUG LOG OUTPUT (console + persistent file, so the process is
-#     reviewable afterward even when running invisibly in Quiet mode) ---
 $script:logFilePath = if ($env:OS -eq "Windows_NT") {
     Join-Path $installDir "alcolock.log"
 } else {
@@ -184,17 +103,11 @@ function Write-Log {
     } catch {}
 }
 
-# --- SERIAL PORT AUTODETECTION ---
 function Find-SerialPort {
     param([string]$override = "")
-
-    if ($override) {
-        Write-Log "Port manually set via -Port: $override" "Cyan"
-        return $override
-    }
+    if ($override) { return $override }
 
     if ($env:OS -eq "Windows_NT") {
-        # 1) Try to find the port by device description (real Arduino Uno chip and clones)
         try {
             $devices = Get-CimInstance -ClassName Win32_PnPEntity -ErrorAction Stop |
                 Where-Object { $_.Name -match '\(COM\d+\)' }
@@ -204,76 +117,39 @@ function Find-SerialPort {
                 $_.Name -match 'USB-SERIAL' -or $_.Name -match 'CP210' -or $_.Name -match 'FTDI'
             })
 
-            if ($known.Count -gt 1) {
-                Write-Log "Multiple matching devices found, using the first one. If it's wrong, set the port manually (-Port):" "Yellow"
-                $known | ForEach-Object { Write-Log "  - $($_.Name)" "Yellow" }
-            }
-
             if ($known.Count -ge 1 -and $known[0].Name -match '\((COM\d+)\)') {
-                Write-Log "Autodetect (Windows): found device '$($known[0].Name)' -> $($matches[1])" "Green"
                 return $matches[1]
             }
-        } catch {
-            Write-Log "Failed to query devices via WMI/CIM: $_" "Yellow"
-        }
+        } catch {}
 
-        # 2) Fallback: no exact match found - take the first available COM port
         $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object)
-        if ($ports.Count -gt 1) {
-            Write-Log "Multiple COM ports available ($($ports -join ', ')), using the first: $($ports[0]). If it's wrong, set -Port manually." "Yellow"
-        }
-        if ($ports.Count -ge 1) {
-            Write-Log "Autodetect (Windows, fallback): $($ports[0])" "Green"
-            return $ports[0]
-        }
-
+        if ($ports.Count -ge 1) { return $ports[0] }
         return $null
     }
     else {
-        # Linux: prioritize ttyACM (native USB CDC, as on Uno/Leonardo), then ttyUSB (USB-UART adapters)
         $candidates = @()
         $candidates += Get-ChildItem -Path /dev -Filter "ttyACM*" -ErrorAction SilentlyContinue
         $candidates += Get-ChildItem -Path /dev -Filter "ttyUSB*" -ErrorAction SilentlyContinue
-
-        if ($candidates.Count -gt 1) {
-            Write-Log "Multiple devices found ($($candidates.FullName -join ', ')), using the first one. If it's wrong, set -Port manually." "Yellow"
-        }
-        if ($candidates.Count -ge 1) {
-            Write-Log "Autodetect (Linux): $($candidates[0].FullName)" "Green"
-            return $candidates[0].FullName
-        }
-
+        if ($candidates.Count -ge 1) { return $candidates[0].FullName }
         return $null
     }
 }
 
 function Resolve-SerialPort {
     param([string]$override = "")
-
     for ($attempt = 1; $attempt -le $portRetryAttempts; $attempt++) {
         $found = Find-SerialPort -override $override
         if ($found) { return $found }
-
-        Write-Log "Port not found (attempt $attempt/$portRetryAttempts). Retrying in $portRetryDelaySec sec..." "Yellow"
+        Write-Log "Port not found (attempt $attempt/$portRetryAttempts). Retrying..." "Yellow"
         Start-Sleep -Seconds $portRetryDelaySec
     }
-
-    throw "Could not find a serial port after $portRetryAttempts attempts. Connect the device or set the port manually: -Port COM5 (Windows) / -Port /dev/ttyACM0 (Linux)."
+    throw "Could not find a serial port."
 }
 
-# --- UI AND LOCKING FUNCTIONS ---
 function Show-PasswordDialog {
     param([string]$promptTitle, [string]$promptText)
-    
-    if ($Debug) {
-        Write-Log "[DEBUG] Password dialog skipped (Debug active). Returning $null." "Yellow"
-        return $null
-    }
-
-    if ($env:OS -ne "Windows_NT") {
-        Write-Log "[WARNING] GUI unavailable. Enter the password in the console:" "Yellow"
-        return Read-Host "Master password"
-    }
+    if ($Debug) { return $null }
+    if ($env:OS -ne "Windows_NT") { return Read-Host "Master password" }
     
     $form = New-Object System.Windows.Forms.Form
     $form.Text = $promptTitle
@@ -303,17 +179,9 @@ function Show-PasswordDialog {
     $form.AcceptButton = $button
     $form.Controls.Add($button)
 
-    if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
-        return $textBox.Text
-    }
+    if ($form.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { return $textBox.Text }
     return $null
 }
-
-# --- FULLSCREEN BLOCKING OVERLAY (replaces LockWorkStation entirely) ---
-# Windows' native lock screen (Secure Desktop) can't display live status, so
-# instead of locking the OS session, this app-level window IS the barrier:
-# always-on-top, borderless, spans all monitors, and disables its own close
-# button. The only ways out are a genuine sober breath or the master password.
 
 function New-OverlayForm {
     $form = New-Object System.Windows.Forms.Form
@@ -326,10 +194,6 @@ function New-OverlayForm {
     $form.ControlBox = $false
     $form.ShowInTaskbar = $true
 
-    # Center content on the PRIMARY screen (the form itself still spans every
-    # monitor via VirtualScreen above, to block them all - but the readable
-    # content is centered on the main display, not pinned to a fixed pixel
-    # offset that only looked right in the corner of one specific resolution).
     $primary = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $contentWidth = 760
     $contentX = $primary.X + [int](($primary.Width - $contentWidth) / 2)
@@ -369,7 +233,6 @@ function New-OverlayForm {
     $pwLabel.Location = New-Object System.Drawing.Point($contentX, ($topY + 280))
     $form.Controls.Add($pwLabel)
 
-    # Password box + Unlock button, centered together as a pair
     $pwBoxWidth = 250
     $btnWidth = 100
     $gap = 10
@@ -400,12 +263,6 @@ function New-OverlayForm {
     $errorLbl.Location = New-Object System.Drawing.Point($contentX, ($pairY + 42))
     $form.Controls.Add($errorLbl)
 
-    # Close button - HIDDEN by default. Only ever shown after the person has
-    # already passed verification (see the success path in
-    # Show-VerificationOverlay), as a manual fallback in case the automatic
-    # close-on-success timer ever fails to fire. It must NEVER be shown while
-    # still locked/waiting - that would let anyone bypass the whole point of
-    # this tool with a single click, with no breath test or password needed.
     $closeBtn = New-Object System.Windows.Forms.Button
     $closeBtn.Text = "✕  Close"
     $closeBtn.Font = New-Object System.Drawing.Font("Segoe UI", 10)
@@ -414,9 +271,6 @@ function New-OverlayForm {
     $closeBtn.Visible = $false
     $form.Controls.Add($closeBtn)
 
-    # Fight back a little if the user alt-tabs away - not real security (a
-    # determined user can still kill the process via Task Manager), just
-    # keeps the window from being trivially ignored.
     $form.Add_Deactivate({
         $form.TopMost = $false
         $form.TopMost = $true
@@ -441,14 +295,14 @@ function Show-VerificationOverlay {
 
     try { $serialPort.DiscardInBuffer() } catch {}
 
-    $rearmThreshold = $baselineVal + 40   # Level the chamber must drop below to be considered clear
-    $minBlowingVal  = $baselineVal + 10   # Minimum level for a clean breath
-    $deltaTrigger   = 15                  # Minimum sharp jump (+15) to detect an impulse
+    $rearmThreshold = $baselineVal + 40   
+    $minBlowingVal  = $baselineVal + 10   
+    $deltaTrigger   = 15                  
 
     Write-Log "LOCKED! Waiting for the sensor chamber to clear (value must drop below $rearmThreshold)..." "Red"
 
     $state = @{
-        Stage                   = "Rearm"   # "Rearm" or "Breath"
+        Stage                   = "Rearm"
         LastRearmVal            = $baselineVal
         PrevVal                 = $baselineVal
         ConsecutiveSoberSeconds = 0
@@ -483,8 +337,6 @@ function Show-VerificationOverlay {
         if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { & $tryUnlock }
     }.GetNewClosure())
 
-    # Only ever becomes visible in the success path below - closing here is
-    # equivalent to it already being unlocked, not a way to skip verification.
     $ui.CloseButton.Add_Click({
         try { $state.CloseTimer.Stop() } catch {}
         $form.Close()
@@ -499,7 +351,7 @@ function Show-VerificationOverlay {
         try {
             $line = $serialPort.ReadLine().Trim()
         } catch {
-            return  # read timeout / no data this tick - fine, just wait for the next one
+            return
         }
         if ($line -notmatch '^\d+$') { return }
         [int]$val = $line
@@ -507,30 +359,26 @@ function Show-VerificationOverlay {
         if ($state.Stage -eq "Rearm") {
             $state.LastRearmVal = $val
             if ($val -le $rearmThreshold) {
-                Write-Log "Chamber cleared ($val <= $rearmThreshold). System ready for a new breath test!" "Green"
-                Write-Log "Waiting for a sharp breath (impulse +$deltaTrigger over 0.5s, corridor: from $minBlowingVal to $threshold)..." "Yellow"
+                Write-Log "Chamber cleared. System ready for a new breath test!" "Green"
                 $state.Stage = "Breath"
                 $state.PrevVal = $state.LastRearmVal
                 $ui.Headline.Text = "Ready - blow into the sensor"
                 $ui.Detail.Text = "Needs a sharp jump above $minBlowingVal, then stay below $threshold for $soberTime sec."
             } else {
-                Write-Log "Clearing chamber: $val (waiting for <= $rearmThreshold)" "DarkGray"
                 $ui.Headline.Text = "Alcohol detected - waiting for the sensor to clear"
                 $ui.Detail.Text = "Current reading: $val  (need <= $rearmThreshold)`nDo not blow yet."
             }
             return
         }
 
-        # Stage = Breath
         $delta = $val - $state.PrevVal
 
         if (-not $state.IsBlowingStarted) {
             if ($delta -ge $deltaTrigger -and $val -ge $minBlowingVal) {
                 $state.IsBlowingStarted = $true
-                Write-Log "Breath IMPULSE detected! (Jump of +$delta, current: $val). Measuring sobriety ($soberTime sec)..." "Yellow"
+                Write-Log "Breath IMPULSE detected! Measuring sobriety..." "Yellow"
                 $ui.Headline.Text = "Breath detected - keep going"
             } else {
-                Write-Log "Waiting for breath... Value: $val (Delta: $delta, need jump >= +$deltaTrigger)" "DarkGray"
                 $ui.Headline.Text = "Ready - blow into the sensor"
                 $ui.Detail.Text = "Current reading: $val  (need a sharp jump above $minBlowingVal)"
                 $state.PrevVal = $val
@@ -538,11 +386,9 @@ function Show-VerificationOverlay {
             }
         }
 
-        Write-Log "Blowing: $val (Corridor: $minBlowingVal - $threshold, Progress: $($state.ConsecutiveSoberSeconds)/$soberTime sec)" "Magenta"
         $ui.Detail.Text = "Reading: $val  (must stay < $threshold)`nSober for $($state.ConsecutiveSoberSeconds)/$soberTime sec - keep breathing steadily."
 
         if ($val -lt $minBlowingVal) {
-            Write-Log "Breath interrupted! Resetting counter." "Yellow"
             $ui.Headline.Text = "Breath interrupted - blow again"
             $state.ConsecutiveSoberSeconds = 0
             $state.IsBlowingStarted = $false
@@ -552,13 +398,10 @@ function Show-VerificationOverlay {
             if ($state.ConsecutiveSoberSeconds -ge $soberTime) {
                 Write-Log "Successful breath test! Access restored." "Green"
                 $ui.Headline.Text = "Success!"
-                $ui.Detail.Text = "You are clear. Closing automatically - or click Close below."
+                $ui.Detail.Text = "You are clear. Closing automatically."
                 $state.AllowClose = $true
                 $timer.Stop()
-                # Store the close-timer on $state (not a bare local variable) so
-                # it stays referenced/alive until it actually fires - a local-only
-                # Timer here risked being garbage-collected before its first tick,
-                # which is exactly why the window used to stay open after "Success!".
+                
                 $state.CloseTimer = New-Object System.Windows.Forms.Timer
                 $state.CloseTimer.Interval = 700
                 $state.CloseTimer.Add_Tick({ try { $state.CloseTimer.Stop(); $form.Close() } catch {} }.GetNewClosure())
@@ -567,7 +410,6 @@ function Show-VerificationOverlay {
             }
         }
         else {
-            Write-Log "ALCOHOL DETECTED IN BREATH! ($val >= $threshold)" "Red"
             $ui.Headline.Text = "Still over the limit"
             $ui.Detail.Text = "Reading: $val  (limit: $threshold)`nWait for the sensor to clear, then try again."
             $state.ConsecutiveSoberSeconds = 0
@@ -575,9 +417,7 @@ function Show-VerificationOverlay {
         }
 
         $state.PrevVal = $val
-      } catch {
-          Write-Log "Unexpected error in verification timer tick (ignored, will retry): $_" "Yellow"
-      }
+      } catch { }
     }.GetNewClosure())
 
     $form.Add_Shown({ $form.Activate(); $ui.PasswordBox.Focus() }.GetNewClosure())
@@ -588,10 +428,6 @@ function Show-VerificationOverlay {
 }
 
 function Show-WaitingOverlay {
-    # Simpler overlay for scenarios with no live sensor data to test against
-    # (sensor disconnected, port failed to open): shows a message and only
-    # accepts the master password, optionally auto-closing via $checkAction
-    # (e.g. polling for the sensor to reconnect).
     param(
         [string]$message,
         [scriptblock]$checkAction = $null,
@@ -632,19 +468,13 @@ function Show-WaitingOverlay {
         $timer.Add_Tick({
           try {
             $ready = $false
-            try {
-                $ready = & $checkAction
-            } catch {
-                Write-Log "checkAction failed this tick (will retry): $_" "Yellow"
-            }
+            try { $ready = & $checkAction } catch { }
             if ($ready) {
                 $ctrl.AllowClose = $true
                 $timer.Stop()
                 $form.Close()
             }
-          } catch {
-              Write-Log "Unexpected error in waiting-overlay timer tick (ignored, will retry): $_" "Yellow"
-          }
+          } catch { }
         }.GetNewClosure())
         $timer.Start()
     }
@@ -654,10 +484,7 @@ function Show-WaitingOverlay {
     if ($timer) { $timer.Stop(); $timer.Dispose() }
 }
 
-# --- REMOVAL AND FULL CLEANUP ---
 function Remove-AlcoLock {
-    Write-Log "Requesting cleanup and system shutdown..." "Yellow"
-    
     $inputPass = Show-PasswordDialog -promptTitle "Remove AlcoLock" -promptText "Enter the master password for full cleanup:"
     if ($inputPass -eq $masterPass) {
         try {
@@ -669,26 +496,16 @@ function Remove-AlcoLock {
             } else {
                 Write-Log "Task and files cleaned up." "Green"
             }
-        }
-        catch {
-            Write-Log "Error during removal: $_" "Red"
-        }
+        } catch {}
     } else {
         if ($env:OS -eq "Windows_NT") {
             [System.Windows.Forms.MessageBox]::Show("Incorrect master password!", "Access Denied", 0, 48)
-        } else {
-            Write-Log "Incorrect master password!" "Red"
         }
     }
 }
 
-# --- SELF-INSTALL TO AUTOSTART ---
 function Install-Self {
-    if ($Debug) {
-        Write-Log "[DEBUG] Skipping autostart (-Debug active)." "Cyan"
-        return
-    }
-
+    if ($Debug) { return }
     if ($env:OS -ne "Windows_NT") { return }
 
     $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -711,29 +528,12 @@ function Install-Self {
         $trigger = New-ScheduledTaskTrigger -AtLogOn
     }
     
-    # RestartCount/RestartInterval: if the process is killed (Task Manager,
-    # crash, etc.), Task Scheduler relaunches it instead of leaving the
-    # machine unmonitored until next logon - the Linux side already gets
-    # this for free from systemd's Restart=on-failure.
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
-
-    # Run as the current interactive user (NOT SYSTEM) - a SYSTEM-context task
-    # runs in the non-interactive Session 0, where a WinForms window would be
-    # invisible/unusable to whoever's actually logged in. RunLevel Highest
-    # keeps the same elevated behavior as this initial interactive install.
     $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Highest
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
-
-    $verify = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($verify) {
-        Write-Log "Scheduled task '$taskName' registered (runs as $env:USERDOMAIN\$env:USERNAME, interactive)." "Green"
-    } else {
-        Write-Log "WARNING: Scheduled task registration did not appear to succeed - check manually with Get-ScheduledTask -TaskName '$taskName'." "Red"
-    }
 }
 
-# --- CLEANUP HANDLING ---
 if ($Cleanup -or $DisableAutostart) {
     Remove-AlcoLock
     exit
@@ -741,95 +541,114 @@ if ($Cleanup -or $DisableAutostart) {
 
 Install-Self
 
-# --- STARTUP CALIBRATION AND WARMUP ---
 function Initialize-Baseline {
-    param([System.IO.Ports.SerialPort]$serialPort)
+    param(
+        [System.IO.Ports.SerialPort]$serialPort,
+        [bool]$ShowUI = $false
+    )
 
     Write-Log "Initializing sensor: starting calibration and warmup ($warmupSec sec)..." "Yellow"
-
     try { $serialPort.DiscardInBuffer() } catch {}
 
     $samples = [System.Collections.Generic.List[int]]::new()
     $startTime = [DateTime]::Now
 
-    while (([DateTime]::Now - $startTime).TotalSeconds -lt $warmupSec) {
-        try {
-            $line = $serialPort.ReadLine().Trim()
-            if ($line -match '^\d+$') {
-                [int]$val = $line
-                # Filter out buffer glitches and anomalies (> 500)
-                if ($val -lt 500) {
-                    $samples.Add($val)
-                    Write-Log "Startup calibration: $val (samples: $($samples.Count))" "DarkGray"
-                } else {
-                    Write-Log "Skipped anomalous spike: $val" "Yellow"
-                }
+    if ($ShowUI) {
+        $ui = New-OverlayForm
+        $form = $ui.Form
+        $ui.Headline.Text = "Calibrating Sensor"
+        $ui.PasswordBox.Visible = $false
+        $ui.UnlockButton.Visible = $false
+        $ui.ErrorLabel.Visible = $false
+        $ui.CloseButton.Visible = $false
+
+        $state = @{ AllowClose = $false }
+        $form.Add_FormClosing({
+            param($s, $e)
+            if (-not $state.AllowClose) { $e.Cancel = $true }
+        }.GetNewClosure())
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 500
+        $timer.Add_Tick({
+            $elapsed = [Math]::Floor(([DateTime]::Now - $startTime).TotalSeconds)
+            $remain = $warmupSec - $elapsed
+            if ($remain -gt 0) {
+                $ui.Detail.Text = "Warming up and reading baseline... Please wait $remain seconds."
+                try {
+                    $line = $serialPort.ReadLine().Trim()
+                    if ($line -match '^\d+$') {
+                        [int]$val = $line
+                        if ($val -lt 500) { $samples.Add($val) }
+                    }
+                } catch {}
+            } else {
+                $state.AllowClose = $true
+                $timer.Stop()
+                $form.Close()
             }
-        } catch {
-            Write-Log "Error reading during calibration!" "Red"
+        }.GetNewClosure())
+
+        $timer.Start()
+        $form.ShowDialog() | Out-Null
+        if ($timer) { $timer.Stop(); $timer.Dispose() }
+    } else {
+        while (([DateTime]::Now - $startTime).TotalSeconds -lt $warmupSec) {
+            try {
+                $line = $serialPort.ReadLine().Trim()
+                if ($line -match '^\d+$') {
+                    [int]$val = $line
+                    if ($val -lt 500) { $samples.Add($val) }
+                }
+            } catch {}
+            Start-Sleep -Milliseconds 500
         }
-        Start-Sleep -Milliseconds 500
     }
 
-    $baselineVal = 80 # Default fallback
+    $baselineVal = 80
     $lastRawVal = $baselineVal
 
     if ($samples.Count -gt 0) {
-        # Take the second half of the samples (once the sensor has stabilized)
         $halfIndex = [math]::Floor($samples.Count / 2)
         $stableSamples = $samples.GetRange($halfIndex, $samples.Count - $halfIndex)
         
         $sum = 0
         foreach ($s in $stableSamples) { $sum += $s }
-        $baselineVal = [math]::Round($sum / $stableSamples.Count)
+        if ($stableSamples.Count -gt 0) {
+            $baselineVal = [math]::Round($sum / $stableSamples.Count)
+        }
         $lastRawVal = $samples[$samples.Count - 1]
 
         if ($baselineVal -ge $maxSaneBaseline) {
-            Write-Log "WARNING: calibrated baseline ($baselineVal) is unusually high - the air may not have been clean during startup (e.g. alcohol was already present). Clamping to $maxSaneBaseline so detection doesn't get silently weakened." "Yellow"
             $baselineVal = $maxSaneBaseline
         }
     }
 
-    Write-Log "Calibration complete! Clean air baseline value: $baselineVal" "Green"
+    Write-Log "Calibration complete! Clean air baseline: $baselineVal" "Green"
     return [PSCustomObject]@{ Baseline = $baselineVal; LastReading = $lastRawVal }
 }
 
-# --- SENSOR CONNECTION (never throws - returns $null on failure so the
-#     caller can route to the blocking overlay instead of silently exiting).
-#     Used both for the initial connection and every reconnect, so that
-#     turning the device off/unplugging it can never be used to cancel
-#     verification - a missing sensor always demands the master password
-#     or a real reconnect, the same as a mid-session disconnect does. ---
 function Connect-Sensor {
     param([string]$override = "")
     try {
         $portName = Resolve-SerialPort -override $override
         $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, None, 8, One
+        $port.ReadTimeout = 1000 # Защита от вечного зависания
         $port.Open()
-        Write-Log "Using port: $portName" "Green"
         return $port
     } catch {
-        Write-Log "Could not connect to the sensor: $_" "Red"
         return $null
     }
 }
 
-# Single-attempt variant, safe to call from a WinForms Timer.Add_Tick handler
-# (i.e. from checkAction inside Show-WaitingOverlay). Connect-Sensor calls
-# Resolve-SerialPort, which internally retries with Start-Sleep for up to
-# ~12+ seconds - doing that on the UI thread freezes the whole window (no
-# keyboard input gets through, and Windows may treat it as "Not Responding"
-# and let Alt+F4 bypass the app's own close-cancellation entirely). The
-# Timer's own recurring tick already provides the retry cadence, so this
-# version tries exactly once and returns immediately either way.
 function Connect-SensorOnce {
     param([string]$override = "")
     try {
         $portName = Find-SerialPort -override $override
         if (-not $portName) { return $null }
         $port = New-Object System.IO.Ports.SerialPort $portName, $baudRate, None, 8, One
+        $port.ReadTimeout = 1000 # Защита от вечного зависания
         $port.Open()
-        Write-Log "Using port: $portName" "Green"
         return $port
     } catch {
         return $null
@@ -837,88 +656,67 @@ function Connect-SensorOnce {
 }
 
 # --- MAIN OPERATING LOOP ---
-Write-Log "Starting AlcoLock. Mode: $Mode." "Green"
-
-# Single-instance guard: if another copy already holds the serial port
-# (e.g. Quiet mode running continuously while the Normal-mode hourly trigger
-# also fires), a second instance would fail to open the port and could be
-# mistaken for "sensor not found" - refuse to fight over it instead.
-# (Mutex is released automatically by the OS when this process exits.)
 $createdNew = $false
 $instanceMutex = New-Object System.Threading.Mutex($true, "Global\AlcoLockSingleInstance", [ref]$createdNew)
-if (-not $createdNew) {
-    Write-Log "Another AlcoLock instance is already running - exiting to avoid fighting over the serial port." "Yellow"
-    exit
-}
-if ($Debug) { Write-Log "DEBUG MODE ACTIVE" "Yellow" }
+if (-not $createdNew) { exit }
 
 $serialPort = Connect-Sensor -override $Port
+$neededRecoveryUI = $false
 
 if (-not $serialPort) {
+    $neededRecoveryUI = $true
     Show-WaitingOverlay -message "Sensor not found. Connect the device to continue, or enter the master password." -checkAction {
         $script:serialPort = Connect-SensorOnce -override $Port
         return [bool]$script:serialPort
     }.GetNewClosure() -checkIntervalMs 2000
+    
+    # КРИТИЧЕСКИЙ ФИКС: подтягиваем заново подключенный порт в локальную область видимости
+    $serialPort = $script:serialPort
 }
 
 if ($serialPort) {
     try {
-        # Warmup and clean-air measurement is performed ONCE at script startup
-        $calibration = Initialize-Baseline -serialPort $serialPort
+        # Если это Normal режим ИЛИ мы только что восстановились из ошибки - показываем UI калибровки
+        $showCalibUI = ($Mode -eq "Normal" -or $neededRecoveryUI)
+        $calibration = Initialize-Baseline -serialPort $serialPort -ShowUI $showCalibUI
         $globalBaseline = $calibration.Baseline
 
         if ($Mode -eq "Normal") {
-            # ================= NORMAL MODE =================
-            # Intentionally unconditional: this is a periodic sobriety check-in
-            # (e.g. hourly via Task Scheduler), not a reaction to a detected
-            # spike - the whole point is to make sure the person at the
-            # computer stays sober, checked at regular intervals.
             Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
-            Write-Log "Check complete. Script will exit until next hour." "Cyan"
-
         } else {
-            # ================= QUIET MODE =================
             while ($serialPort.IsOpen) {
                 try {
                     $line = $serialPort.ReadLine().Trim()
                     if ($line -match '^\d+$') {
                         [int]$val = $line
-                        Write-Log "Background monitoring: $val" "White"
-
                         if ($val -gt $threshold) {
-                            Write-Log "THRESHOLD EXCEEDED! ($val > $threshold)" "Red"
-                            # Reuse the already-known $globalBaseline, without another 10-sec warmup
                             Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
                         }
                     }
                 }
                 catch {
-                    Write-Log "WARNING: SENSOR DISCONNECTED OR COM PORT CONNECTION LOST!" "Red"
-
-                    Show-WaitingOverlay -message "Sensor disconnected. Reconnect the device to unlock, or enter the master password." -checkAction {
+                    Show-WaitingOverlay -message "Sensor disconnected. Reconnect the device to unlock." -checkAction {
                         $script:serialPort = Connect-SensorOnce -override $Port
                         return [bool]$script:serialPort
                     }.GetNewClosure() -checkIntervalMs 1000
 
+                    # ФИКС: обновляем переменную для while ($serialPort.IsOpen)
+                    $serialPort = $script:serialPort
+
                     if ($serialPort -and $serialPort.IsOpen) {
-                        # Recalibrate clean air on reconnect
-                        $calibration = Initialize-Baseline -serialPort $serialPort
+                        # Обязательно показываем UI при рекалибровке, чтобы не дать "бесплатных" 10 секунд
+                        $calibration = Initialize-Baseline -serialPort $serialPort -ShowUI $true
                         $globalBaseline = $calibration.Baseline
                         if ($calibration.LastReading -gt $threshold) {
                             Show-VerificationOverlay -serialPort $serialPort -baselineVal $globalBaseline
-                        } else {
-                            Write-Log "Sensor reconnected, reading is sober ($($calibration.LastReading) <= $threshold) - resuming background monitoring." "Green"
                         }
                     }
                 }
-
-                Start-Sleep -Seconds 2
+                Start-Sleep -Milliseconds 500
             }
         }
     }
     finally {
-        if ($serialPort.IsOpen) { $serialPort.Close() }
+        if ($serialPort -and $serialPort.IsOpen) { $serialPort.Close() }
     }
-} else {
-    Write-Log "No sensor connection available (master password was used to bypass) - exiting." "Yellow"
 }
