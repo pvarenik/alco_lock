@@ -1242,8 +1242,9 @@ function Invoke-SelfTest {
 
     $simState = 'WaitingForBreath'
     $simRecent = New-Object System.Collections.Generic.List[int]
-    $simSequence = @(205, 250, 210, 255, 220, 240)
+    $simSequence = @(205, 250, 210, 220, 240, 220)
 
+    # Corrected: no 3-sample window contains 2 values >= threshold (245).
     foreach ($value in $simSequence) {
         if ($simState -eq 'WaitingForBreath') {
             $simRecent.Add($value)
