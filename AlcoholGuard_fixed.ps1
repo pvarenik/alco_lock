@@ -1064,9 +1064,32 @@ function Invoke-SelfTest {
     $unsafeSafeCount = @($unsafe | Where-Object { $_ -le $AlcoholLimit }).Count
     Assert-Test 'High readings do not allow unlock' ($unsafeSafeCount -lt $SafeReadingsRequired)
 
-    $oscillating = @(260, 360, 340, 370, 330)
-    $oscSafeCount = @($oscillating | Where-Object { $_ -le $AlcoholLimit }).Count
-    Assert-Test 'Non-consecutive safe values do not unlock by themselves' ($oscSafeCount -lt $SafeReadingsRequired)
+    # Non-consecutive safe readings must NOT unlock.
+    # The safe-reading counter must reset whenever a value is above the alcohol limit.
+  
+    $oscillating = @(260, 360, 340, 370, 330, 340)
+
+    $oscSafe = 0
+    $oscUnlocked = $false
+
+    foreach ($value in $oscillating) {
+
+        if ($value -le $AlcoholLimit) {
+            $oscSafe++
+        }
+        else {
+            $oscSafe = 0
+        }
+
+        if ($oscSafe -ge $SafeReadingsRequired) {
+            $oscUnlocked = $true
+            break
+        }
+    }
+
+    Assert-Test `
+        'Non-consecutive safe values do not unlock by themselves' `
+        (-not $oscUnlocked)
 
     Assert-Test 'Master password is 1989' ($MasterPassword -eq '1989')
     Assert-Test 'Alcohol limit is 350' ($AlcoholLimit -eq 350)
