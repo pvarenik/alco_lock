@@ -61,30 +61,44 @@ function Write-Log {
     } catch {}
 }
 
+function Get-SystemSerialPorts {
+    $foundPorts = @()
+
+    # Метод 1: Нативный .NET API
+    try {
+        $netPorts = [System.IO.Ports.SerialPort]::GetPortNames()
+        if ($netPorts) { $foundPorts += $netPorts }
+    } catch {}
+
+    # Метод 2: Прямое чтение реестра Windows (на случай сбоя .NET)
+    if ($env:OS -eq "Windows_NT") {
+        try {
+            $regKey = "HKLM:\HARDWARE\DEVICEMAP\SERIALCOMM"
+            if (Test-Path $regKey) {
+                $regProps = Get-ItemProperty -Path $regKey
+                foreach ($prop in $regProps.PSObject.Properties) {
+                    if ($prop.Name -notmatch '^PS' -and $prop.Value -match '^COM\d+$') {
+                        $foundPorts += $prop.Value
+                    }
+                }
+            }
+        } catch {}
+    }
+
+    return @($foundPorts | Select-Object -Unique | Sort-Object)
+}
+
 function Find-SerialPort {
     param([string]$override = "")
     if ($override) { return $override }
 
-    if ($env:OS -eq "Windows_NT") {
-        try {
-            $ports = @([System.IO.Ports.SerialPort]::GetPortNames() | Select-Object -Unique | Sort-Object)
-            if ($ports.Count -eq 0) { return $null }
-            
-            # Фильтруем встроенный материнский COM1, если есть другие порты
-            $usbPorts = @($ports | Where-Object { $_ -ne "COM1" })
-            if ($usbPorts.Count -ge 1) { return $usbPorts[-1] }
-            return $ports[0]
-        } catch {
-            return $null
-        }
-    }
-    else {
-        $candidates = @()
-        $candidates += Get-ChildItem -Path /dev -Filter "ttyACM*" -ErrorAction SilentlyContinue
-        $candidates += Get-ChildItem -Path /dev -Filter "ttyUSB*" -ErrorAction SilentlyContinue
-        if ($candidates.Count -ge 1) { return $candidates[0].FullName }
-        return $null
-    }
+    $ports = Get-SystemSerialPorts
+    if ($ports.Count -eq 0) { return $null }
+    
+    # Исключаем системный порт COM1, если есть другие USB-порты
+    $usbPorts = @($ports | Where-Object { $_ -ne "COM1" })
+    if ($usbPorts.Count -ge 1) { return $usbPorts[-1] }
+    return $ports[0]
 }
 
 function Show-PasswordDialog {
@@ -597,9 +611,13 @@ function Initialize-Baseline {
 function Connect-SensorOnce {
     param([string]$override = "")
     $portName = Find-SerialPort -override $override
-    if (-not $portName) { return $null }
+    if (-not $portName) { 
+        Write-Log "No COM ports detected in system." "DarkGray"
+        return $null 
+    }
 
-    # Повторные попытки открытия порта с паузой (учитывает время инициализации драйвера USB)
+    Write-Log "Attempting connection to $portName..." "Yellow"
+
     for ($attempt = 1; $attempt -le 3; $attempt++) {
         $port = $null
         try {
@@ -610,8 +628,14 @@ function Connect-SensorOnce {
 
             Start-Sleep -Milliseconds 400
             $port.DiscardInBuffer()
+            Write-Log "Successfully connected to $portName!" "Green"
             return $port
+        } catch [System.UnauthorizedAccessException] {
+            Write-Log "ERROR: Port $portName is locked by another process (Arduino IDE, another script, etc.)." "Red"
+            if ($port -and $port.IsOpen) { try { $port.Close() } catch {} }
+            return $null
         } catch {
+            Write-Log "Open attempt $attempt failed for $portName : $_" "DarkGray"
             if ($port -and $port.IsOpen) { try { $port.Close() } catch {} }
             Start-Sleep -Milliseconds 300
         }
@@ -632,17 +656,20 @@ function Connect-Sensor {
 # --- MAIN OPERATING LOOP ---
 $createdNew = $false
 $instanceMutex = New-Object System.Threading.Mutex($true, "Global\AlcoLockSingleInstance", [ref]$createdNew)
-if (-not $createdNew) { exit }
+if (-not $createdNew) { 
+    Write-Log "Another AlcoLock process is already running. Exiting." "Yellow"
+    exit 
+}
 
 $serialPort = Connect-SensorOnce -override $Port
 $neededRecoveryUI = $false
 
 if (-not $serialPort) {
     $neededRecoveryUI = $true
-    Show-WaitingOverlay -message "Sensor not found. Connect the device to continue, or enter the master password." -checkAction {
+    Show-WaitingOverlay -message "Sensor not found or port occupied. Connect the device or enter the master password." -checkAction {
         $script:serialPort = Connect-SensorOnce -override $Port
         return [bool]($script:serialPort -ne $null)
-    }.GetNewClosure() -checkIntervalMs 1000
+    }.GetNewClosure() -checkIntervalMs 1200
     
     $serialPort = $script:serialPort
 }
