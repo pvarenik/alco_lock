@@ -1,419 +1,736 @@
-# AlcoLock
+# ALCOBLOCKER
 
-```
-Сначала я бы запустил именно тесты:
+ALCOBLOCKER is an experimental desktop breath-check gate built around an Arduino + MQ-3 sensor. It has a Windows PowerShell implementation and a Linux/Python implementation.
 
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -SelfTest
+> **Important:** This is an experimental desktop automation project, not a certified breathalyzer, medical device, or reliable BAC/promille measurement system. MQ-3 raw ADC readings depend on warm-up, calibration, sensor condition, temperature, humidity, airflow, contamination, and hardware differences. Do not use this software to make safety-critical decisions such as deciding whether it is safe to drive.
 
-Ожидаемый результат — все тесты [PASS].
+## Quick start
 
-Затем для первого реального запуска:
-
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1
-
-Для подробного режима:
-
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -DebugMode
-
-А удалить установленную задачу:
-
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -CleanUp
-```
-A breathalyzer-gated action blocker. An MQ-3 alcohol sensor connected to an
-Arduino-compatible board feeds live readings over serial to a host-side
-script, which throws up a fullscreen, always-on-top window whenever the
-reading exceeds a configured threshold — and only lets you back in after a
-genuine, fresh, sober breath is measured (or you type a master password).
-
-Two equivalent implementations are provided:
-- **`alco_lock.ps1`** — PowerShell, for Windows.
-- **`alco_lock.py`** — Python, for Linux (see [Linux (Python) version](#linux-python-version)).
-
-Both share the identical sensor-verification logic; only the OS-integration
-pieces (the overlay's GUI toolkit, autostart mechanism) differ.
-
-> Personal joke/self-discipline project: a device that blocks a drunk person
-> from using their own computer. Not a certified breathalyzer, not a legal
-> sobriety test, and not a substitute for one.
-
-## How it works
-
-1. On startup, the script warms up the sensor and calibrates a **clean-air
-   baseline** (average reading with no breath on the sensor).
-2. It continuously watches the sensor. If a reading exceeds `$threshold`, a
-   **fullscreen window opens on top of everything else** — borderless, no
-   close button, always-on-top.
-3. To make it go away, two things must happen in order:
-   - **Re-arm**: the sensor chamber must clear back down close to baseline
-     (residual alcohol vapor has to dissipate first).
-   - **Fresh breath**: a genuine active breath is detected as a *sharp
-     impulse* (a sudden jump in the reading), not just a slow decay curve from
-     the previous test. The reading must then stay inside the sober corridor
-     for `$soberTime` consecutive seconds.
-4. If the breath sample exceeds the threshold, the counter resets and the
-   cycle repeats — all shown live in the window (current reading, what stage
-   you're in, countdown progress).
-5. At any point, typing the correct **master password** into the field at
-   the bottom of the window closes it immediately, bypassing the breath
-   check entirely.
-
-This two-stage sensor design (re-arm + impulse, not just re-arm) exists
-specifically to prevent a false unlock from residual vapor slowly clearing
-after one real (or simulated) breath — see
-[Known limitations](#known-limitations) for the underlying failure mode this
-avoids.
-
-### Why an app window instead of a real OS lock
-
-Earlier versions of this project called the real OS session lock
-(`LockWorkStation` on Windows, `loginctl lock-session` on Linux). That turned
-out to be the wrong tool for the job:
-
-- It hands the actual unlock step over to the **Windows/Linux account
-  password**, which has nothing to do with this project and isn't something
-  you want a script fighting you over.
-- Windows' lock screen runs on an isolated **Secure Desktop** that no
-  ordinary process can draw custom UI on top of — so there was no way to
-  show live sensor readings, timers, or a reason while it was up.
-- On Linux, a real lock only happens if a locker daemon is installed and
-  listening for the signal; otherwise `loginctl lock-session` is a no-op
-  that looks like it worked but doesn't.
-- Worst of all: nothing stopped the verification loop from calling the real
-  lock again 0.5 seconds after you legitimately logged back in, with no
-  explanation - which looked exactly like a broken infinite lock loop.
-
-So this project doesn't touch the OS session lock at all anymore. The
-fullscreen window **is** the entire mechanism: an ordinary top-level
-application window, deliberately configured to be hard to ignore (no
-border, no close button, always-on-top, covers the whole screen), that
-your own script fully controls and can show anything in.
-
-This is *not* a hardened kiosk lock. It doesn't install keyboard hooks and
-doesn't try to block Task Manager, Ctrl+Alt+Del, or the Windows/Super key -
-a determined user (i.e., you, five minutes from now) can always get out via
-Task Manager / `pkill`. That's intentional: this is a personal joke device,
-not something that should risk trapping you with no way out if it ever hits
-a bug.
-
-## Hardware assembly
-
-Tested setup: **Arduino Uno R3 clone (ATmega328 + CH340 USB-serial chip)** +
-a standard 4-pin **MQ-3** breakout module.
-
-### Bill of materials
-
-- Arduino Uno R3 or compatible clone
-- MQ-3 alcohol gas sensor module (the common breakout board with an onboard
-  LM393 comparator - has 4 pins: `VCC`, `GND`, `DO`, `AO`)
-- USB cable (A-to-B, or whatever your board's connector is)
-- 3 male-to-female jumper wires
-
-### Wiring
-
-Only 3 wires - the sensor's digital output (`DO`) isn't used, since we want
-continuous analog readings, not a fixed on/off threshold:
-
-| MQ-3 pin | Arduino Uno pin | Notes |
-|----------|-----------------|-------|
-| `VCC`    | `5V`            | **Must be 5V, not 3.3V** - the sensor's internal heater needs it to reach operating temperature. On a 3.3V-only board, readings will be low and unreliable. |
-| `GND`    | `GND`           | Any GND pin works. |
-| `AO`     | `A0`            | Analog output → analog input. Matches `$mq3Pin` / `MQ3_PIN` in the sketch. |
-| `DO`     | *(unused)*      | Leave disconnected. |
-
-```
-                    MQ-3 alcohol sensor module               
-┌──────────────────────────────────────────────────────────────┐
-│                (4-pin analog breakout module)                │
-│                                                              │
-│         VCC             GND         DO          AO           │
-└──────────┬───────────────┬───────────X───────────┬───────────┘
-           │               │                       │             ◄── leave disconnected
-           │               │                       │           
-┌──────────┴───────────────┴───────────────────────┴───────────┐
-│         5V              GND                     A0           │
-│        POWER                                 ANALOG IN       │
-│                                                              │
-│                    Arduino Uno R3 (clone)                    │
-│                                                              │
-│                                                     [ USB ]  │
-└──────────────────────────────────────────────────────────────┘
-                                                          │
-                                                          └──► to your computer
-```
-
-### Firmware
-
-A ready-to-flash sketch is included: **[`alco_sensor.ino`](./alco_sensor.ino)**.
-It just does `Serial.println(analogRead(A0))` every 500ms at 9600 baud -
-exactly the protocol both host scripts expect (one plain integer per line).
-
-**To flash it:**
-1. Install the [Arduino IDE](https://www.arduino.cc/en/software).
-2. Open `alco_sensor.ino`.
-3. `Tools → Board` → "Arduino Uno" (works fine for CH340 clones too).
-4. `Tools → Port` → select the port that appears when you plug the board in
-   (see the port-autodetection section below for how the host scripts find
-   this automatically).
-   - If the port doesn't show up in the IDE at all, you likely need the
-     **CH340 USB driver** - most genuine Uno R3 boards use an ATmega16u2 for
-     USB and don't need this, but cheap clones almost always use a CH340
-     chip that needs its own driver on Windows (usually auto-installs on
-     Linux). Search "CH340 driver" for your OS if the board isn't detected.
-5. Click **Upload**.
-6. Open `Tools → Serial Monitor`, set baud to **9600** - you should see a
-   stream of numbers (roughly 50-150 in clean air, depending on your unit).
-   If you see garbage characters, the baud rate doesn't match; if you see
-   nothing at all, double check the `AO`→`A0` and power wiring.
-7. Close the Serial Monitor before running `alco_lock.ps1`/`alco_lock.py` -
-   only one program can hold the serial port open at a time.
-
-### Common gotchas
-
-- **The sensor gets warm to the touch during normal operation.** That's the
-  onboard heater doing its job, not a fault.
-- **MQ-3 needs real warmup time to read consistently** - some datasheets
-  recommend a burn-in period on first-ever power-up, and several minutes of
-  warmup on every cold start after that, before readings stabilize. The
-  script's `$warmupSec`/`WARMUP_SEC` (10 seconds) is a placeholder for quick
-  testing - bump it up (a minute or more) once you're doing real runs, or
-  your calibrated baseline may drift for a while after each boot.
-- **Raw ADC values vary a lot between individual MQ-3 units** (sensitivity,
-  the specific load resistor value on your particular breakout board, supply
-  voltage tolerance). The `$threshold = 350` default is a starting point, not
-  a calibrated value - watch a few real clean-air and alcohol-breath readings
-  in the console first (run with `-Debug` on Windows, `--debug` on Linux) and
-  adjust `$threshold`/`THRESHOLD`, `$soberTime`/`SOBER_TIME`, and the
-  `rearmThreshold`/`minBlowingVal`/`deltaTrigger` values inside the
-  verification logic to match your actual hardware.
-- **Breathe onto the sensor's mesh opening directly and closely**, not from
-  across the room - MQ-3 modules are designed for close-range, direct
-  exposure. A short piece of tubing (even a straw) aimed at the sensor grille
-  gives more consistent, repeatable results than free-air breathing.
-- **One program at a time on the serial port.** If the Arduino IDE's Serial
-  Monitor, another terminal, or a leftover AlcoLock process still has the
-  port open, a new run will fail to connect (or fall into the "sensor not
-  found" blocking overlay) until it's released.
-
-Sensor firmware beyond the basic sketch above (smoothing, alternate pins,
-etc.) is up to you to adapt - this project covers the host-side (PC) logic.
-
-## Requirements
-
-**Windows (`alco_lock.ps1`):**
-- PowerShell 7+ (`pwsh`), or Windows PowerShell 5.1.
-- `System.Windows.Forms` / `System.Drawing` (built into .NET on Windows,
-  loaded automatically - nothing extra to install).
-
-**Linux (`alco_lock.py`):** see [Requirements](#requirements-1) under the
-Linux section below.
-
-## Installation
-
-1. Wire up the MQ-3 sensor to your board and flash a sketch that streams
-   readings over serial.
-2. Copy `alco_lock.ps1` anywhere on the target Windows machine.
-3. Run it once manually:
-   ```powershell
-   .\alco_lock.ps1 -Mode Quiet
-   ```
-   On first run (without `-Debug`), the script will:
-   - Re-launch itself elevated (UAC prompt) if not already running as
-     Administrator.
-   - Copy itself to `C:\ProgramData\AlcoLock\alco_lock.ps1`.
-   - Register a Scheduled Task (`AlcoLockSystem`) that runs at logon under the
-     `SYSTEM` account.
-
-From then on, it starts automatically every time you log in.
-
-## Usage
-
-```
-.\alco_lock.ps1 [-Mode Normal|Quiet] [-Debug] [-Port <name>] [-Cleanup] [-Help]
-```
-
-Run `.\alco_lock.ps1 -Help` at any time for a summary with examples directly
-in the console, or `Get-Help .\alco_lock.ps1 -Full` for the complete
-PowerShell help reference.
-
-| Parameter            | Description |
-|-----------------------|-------------|
-| `-Mode Normal\|Quiet`  | `Normal`: show the overlay once immediately, verify sobriety, then exit. `Quiet` (default for real use): run continuously in the background and only show the overlay when the threshold is exceeded. Default: `Normal`. |
-| `-Debug` / `-d`        | Skips autostart installation and the `-Cleanup` password prompt. The overlay itself always runs the same either way - it's an app window, not a real OS lock, so it's always safe to test. |
-| `-Port <name>`         | Force a specific serial port (`COM5`, `/dev/ttyACM0`, etc.), bypassing autodetection. |
-| `-Cleanup` / `-DisableAutostart` | Fully remove the scheduled task and installed files, after confirming the master password. |
-| `-Help` / `-h` / `-?`  | Print usage and examples, then exit — no sensor, autostart, or overlay logic runs. |
-
-### Examples
+### Windows
 
 ```powershell
-# Normal use: background monitoring, autodetected port
-.\alco_lock.ps1 -Mode Quiet
+# Run the existing installed runtime manually
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -Run
 
-# Test the overlay without installing autostart
-.\alco_lock.ps1 -Mode Quiet -Debug
+# Same, with live diagnostic output
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -Run -DebugMode
 
-# Force a specific port when multiple serial devices are connected
-.\alco_lock.ps1 -Mode Quiet -Port COM5
-
-# Uninstall
-.\alco_lock.ps1 -Cleanup
+# Run the built-in tests without starting the GUI
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -SelfTest
 ```
 
-## Serial port autodetection
+When started in normal install mode, the script registers the scheduled task, starts the hidden runtime with `-Run`, and exits. The runtime searches for the Arduino, stabilizes the sensor, calibrates a fresh baseline, waits for a breath, and then either unlocks or stays locked.
 
-The script tries, in order:
-
-1. `-Port` override, if given.
-2. **Windows**: query `Win32_PnPEntity` for a device name containing
-   `Arduino`, `CH340`/`CH341`, `CP210x`, `USB-SERIAL`, or `FTDI`, and extract
-   its COM number.
-3. **Windows fallback**: the first port returned by
-   `[System.IO.Ports.SerialPort]::GetPortNames()`.
-4. **Linux**: `/dev/ttyACM*` first (native USB CDC, as on Uno/Leonardo-class
-   boards), then `/dev/ttyUSB*` (USB-UART adapters).
-
-If nothing is found, it retries a few times (useful right after logon, before
-USB enumeration finishes) before giving up with an explicit error message
-telling you to plug in the device or pass `-Port` manually.
-
-## Configuration
-
-All tunables live at the top of the script:
-
-```powershell
-$threshold  = 350   # Raw ADC reading that counts as "alcohol detected"
-$soberTime  = 5     # Consecutive seconds within the sober range to unlock
-$warmupSec  = 10    # Sensor warmup/calibration duration on startup
-$masterPass = "..."  # Bypasses the overlay entirely when typed into it
-```
-
-Also inside `Show-VerificationOverlay`:
-
-```powershell
-$rearmThreshold = $baselineVal + 40  # Chamber must clear below this to re-arm
-$minBlowingVal  = $baselineVal + 10  # Floor of the valid breath corridor
-$deltaTrigger   = 15                 # Minimum jump to count as a real breath impulse
-```
-
-These thresholds depend heavily on your specific MQ-3 unit, its warmup time,
-and ambient conditions — expect to tune them after a few real test runs.
-
-> ⚠️ `$masterPass` is a hardcoded plaintext string in the script. Anyone with
-> read access to the file (or to `C:\ProgramData\AlcoLock\alco_lock.ps1`) can
-> read it. Treat this as a soft speed bump against casual bypass, not a real
-> access control — change the default before relying on it for anything.
-
-## Known limitations
-
-- **This is an app-level window, not a real OS lock — on purpose** (see
-  [Why an app window instead of a real OS lock](#why-an-app-window-instead-of-a-real-os-lock)
-  above). A determined user can always exit via Task Manager, killing the
-  process, or similar. That's an accepted tradeoff for a personal joke
-  device with no hard-lockout risk, not an oversight.
-- **False-unlock from residual vapor**: earlier versions of this script could
-  misinterpret a slowly-clearing sensor reading (left over from a previous
-  breath) as a fresh sober breath, because the impulse-detection baseline was
-  reset to a stale calibration value instead of the sensor's actual last
-  reading. This is fixed in the current version, but if you fork/modify the
-  breath-detection logic, be careful not to reintroduce it.
-- **MQ-3 sensors need real warmup time.** 10 seconds is a placeholder for
-  quick testing; real MQ-series sensors are commonly specified with warmup
-  times in the range of minutes for a stable baseline. Tune `$warmupSec` for
-  your hardware.
-- **No native USB HID.** A plain Uno/ATmega328 + CH340 board only has a
-  serial link to the PC — it cannot emulate a keyboard, so the board itself
-  can't trigger anything on its own; the host script is what shows the
-  overlay.
-
-## Linux (Python) version
-
-`alco_lock.py` is a native Linux port with the same detection logic (identical
-calibration, re-arm, and impulse-detection stages — including the fix for the
-false-unlock-from-residual-vapor bug described above). System integration is
-adapted to Linux equivalents instead of Windows APIs:
-
-| Windows (`alco_lock.ps1`)        | Linux (`alco_lock.py`)                          |
-|-----------------------------------|--------------------------------------------------|
-| Fullscreen overlay via `System.Windows.Forms` | Fullscreen overlay via `tkinter` |
-| Task Scheduler (`Normal`: hourly trigger, `Quiet`: at logon) | `systemd --user` timer (`alcolock.timer`, hourly) for `Normal`; `systemd --user` service (`alcolock.service`, `WantedBy=default.target`) for `Quiet` |
-| `C:\ProgramData\AlcoLock`        | `~/.local/share/alcolock`                         |
-
-### Requirements
-
-- Python 3.8+
-- [pyserial](https://pypi.org/project/pyserial/):
-  ```bash
-  pip install pyserial --break-system-packages
-  ```
-- `python3-tk`, for the GUI overlay (usually a separate OS package from
-  `python3` itself):
-  ```bash
-  sudo apt install python3-tk        # Debian/Ubuntu
-  sudo dnf install python3-tkinter   # Fedora
-  sudo pacman -S tk                  # Arch
-  ```
-  If it's missing, the script falls back to console-only logging (plus a
-  single `notify-send` alert, if available) instead of crashing - but you
-  lose the actual blocking window, which defeats the point. Install it for
-  real use.
-
-### Usage
-
-```
-alco_lock.py [--mode Normal|Quiet] [--debug] [--port <device>] [--cleanup]
-```
-
-Run `alco_lock.py --help` for the full list of options and examples.
+### Linux
 
 ```bash
-# Normal use: background monitoring, autodetected port
-python3 alco_lock.py --mode Quiet
+# Start the default Linux UI
+python3 AlcoholBlocker.py
 
-# Test the overlay without installing autostart
-python3 alco_lock.py --mode Quiet --debug
+# Start with diagnostic logging in the terminal
+python3 AlcoholBlocker.py --debug
 
-# Force a specific device when multiple serial adapters are connected
-python3 alco_lock.py --mode Quiet --port /dev/ttyACM0
-
-# Uninstall (removes the systemd unit(s) and installed files)
-python3 alco_lock.py --cleanup
+# Run tests without starting the GUI
+python3 AlcoholBlocker.py --self-test
 ```
 
-### Notes specific to the Linux version
+The Linux application follows the same high-level pipeline: find Arduino/CH340, stabilize the sensor, collect a fresh baseline, wait for a five-second downward breath event, compare the observed signal with `baseline + 200`, and unlock or remain locked.
 
-- **Port autodetection** matches the same `Arduino`/`CH340`/`CH341`/
-  `CP210x`/`FTDI`/`USB-SERIAL` description patterns as the Windows version,
-  falling back to `/dev/ttyACM*` then `/dev/ttyUSB*` by device node.
-- Self-install (`install_self`) writes to `~/.config/systemd/user/`, which
-  requires a user systemd instance (the default on virtually all modern
-  distros with systemd; not applicable on non-systemd init systems).
-- **GUI + systemd caveat**: a `systemd --user` service doesn't automatically
-  inherit your graphical session's `DISPLAY`/`XAUTHORITY`, which `tkinter`
-  needs to open a window. `install_self` captures these from the environment
-  at install time and bakes them into the generated `alcolock.service` unit,
-  so run the install step from your actual desktop session (not over a
-  plain SSH connection without X forwarding). If the window still doesn't
-  appear after installing, check `alcolock.log` for a warning and re-run the
-  install from your desktop.
+---
 
-## Logging
+# Hardware: Arduino Uno R3 + MQ-3
 
-Both versions write a persistent, plain-text log (`alcolock.log`, in the
-install directory) mirroring everything printed to the console, so the
-whole process is reviewable afterward even when running invisibly in
-`Quiet` mode (as a hidden scheduled task / systemd service with no visible
-console window).
+ALCOBLOCKER reads the MQ-3 **analog output (AO)** through Arduino Uno R3 pin **A0**. The Arduino sketch sends one raw ADC value (`0..1023`) over the serial port every 500 ms at **9600 baud**. The supplied sketch does not use the MQ-3 digital output (`DO`).
 
-## Uninstalling
+The project targets an Arduino Uno R3 or a compatible clone (for example, an ATmega328 board using a CH340 USB-serial chip) together with a standard 4-pin MQ-3 breakout module (`VCC`, `GND`, `DO`, `AO`).
+
+## Wiring
+
+```text
+          Arduino Uno R3                     MQ-3 breakout
+        +----------------+                 +----------------+
+        |                |                 |                |
+        | 5V  ----------+---------------->| VCC            |
+        |                |                 |                |
+        | GND ----------+---------------->| GND            |
+        |                |                 |                |
+        | A0  <----------+-----------------| AO             |
+        |                |                 |                |
+        |                |                 | DO   NC         |
+        +----------------+                 +----------------+
+
+Serial communication:
+Arduino USB/CH340  <---- USB ---->  Windows / Linux host
+                                   9600 baud
+                                   one integer / line
+                                   every 500 ms
+```
+
+### Pin mapping
+
+| Arduino Uno R3 | MQ-3 module | Purpose |
+|---|---|---|
+| `5V` | `VCC` | Sensor/module power |
+| `GND` | `GND` | Common ground |
+| `A0` | `AO` | Analog sensor reading |
+| — | `DO` | Not used by ALCOBLOCKER |
+
+> **Hardware note:** the repository code assumes a standard 4-pin MQ-3 breakout and reads `AO`. Check the markings and supply requirements of your particular module before powering it; breakout boards can differ.
+
+## Arduino sketch
+
+The complete sketch used by the project is included below. It intentionally does not implement sensor warm-up or baseline calibration on the Arduino itself; the host application performs its stabilization and calibration cycle.
+
+```cpp
+// alco_sensor.ino
+//
+// Streams raw MQ-3 analog readings over serial, one plain integer per line,
+// at 9600 baud - the exact protocol ALCOBLOCKER expects.
+//
+// Hardware: Arduino Uno R3 (or compatible clone, e.g. ATmega328 + CH340) +
+// a standard 4-pin MQ-3 breakout module (VCC / GND / DO / AO).
+
+const int MQ3_PIN = A0;
+const unsigned long SAMPLE_INTERVAL_MS = 500;
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+  int value = analogRead(MQ3_PIN);
+  Serial.println(value);
+  delay(SAMPLE_INTERVAL_MS);
+}
+```
+
+The sketch's serial protocol is deliberately simple:
+
+```text
+622
+623
+621
+620
+...
+```
+
+Each line is a raw Arduino ADC reading from `A0`, in the range `0..1023`. The host application is responsible for interpreting those values.
+
+---
+
+# Windows
+
+## Windows implementation
+
+The Windows implementation is a PowerShell 5.1 script using WinForms for the overlay and Windows PnP for serial-device discovery.
+
+Example filename used during development:
+
+```text
+AlcoholGuard_v24.ps1
+```
+
+Later Windows revisions added UI, cleanup, ten-minute scheduling, improved sensor stabilization, and other refinements. Use the latest Windows script from the repository rather than mixing revisions.
+
+## Windows requirements
+
+- Windows PowerShell 5.1.
+- Arduino-compatible board with MQ-3 sensor.
+- Arduino outputs one integer per line at `9600` baud.
+- Windows must detect the board as a serial device, for example `USB-SERIAL CH340 (COM3)`.
+- Scheduled Task registration may require appropriate Windows permissions depending on the account and Task Scheduler configuration.
+
+Example Arduino sketch:
+
+```cpp
+const int MQ3_PIN = A0;
+const unsigned long SAMPLE_INTERVAL_MS = 500;
+
+void setup() {
+  Serial.begin(9600);
+}
+
+void loop() {
+  int value = analogRead(MQ3_PIN);
+  Serial.println(value);
+  delay(SAMPLE_INTERVAL_MS);
+}
+```
+
+## Windows command-line flags
+
+The script supports four switches:
+
+```text
+-Run
+-CleanUp
+-SelfTest
+-DebugMode
+```
+
+### `-Run`
+
+Starts the actual GUI/runtime instead of installing the scheduled task.
 
 ```powershell
-.\alco_lock.ps1 -Cleanup
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -Run
 ```
 
-Prompts for the master password, then removes the scheduled task and the
-`C:\ProgramData\AlcoLock` directory. On Linux, the equivalent is
-`python3 alco_lock.py --cleanup`.
+Typical use: direct testing or starting the runtime manually.
 
-## License
+### `-DebugMode`
 
-Personal project — add a license file if you plan to publish this publicly.
+Adds detailed runtime information to the console/log.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -Run -DebugMode
+```
+
+Debug output can include:
+
+- Windows PnP serial-port candidates.
+- COM-port probing.
+- Sensor connection/disconnection.
+- Stabilization values.
+- Baseline and calculated thresholds.
+- State transitions.
+- Breath confirmation.
+- Alcohol threshold events.
+- Hourly/ten-minute scheduling events.
+
+`-DebugMode` is also passed to the scheduled runtime when the script is installed with that switch.
+
+### `-SelfTest`
+
+Runs algorithm/configuration tests and exits.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -SelfTest
+```
+
+No GUI or Arduino is required for the algorithm tests.
+
+### `-CleanUp`
+
+Removes the scheduled task and other project-created runtime artifacts according to the cleanup implementation.
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -CleanUp
+```
+
+The cleanup mode is intended to stop the running AlcoholGuard runtime, remove its scheduled task, release/close its own resources, and remove the application's own log/state artifacts. It does not remove unrelated Windows telemetry or system logs.
+
+## Windows launch examples
+
+### Normal installation / persistent setup
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1
+```
+
+Pipeline:
+
+```text
+PowerShell script
+    |
+    +--> register/update Scheduled Task
+    |
+    +--> start hidden PowerShell child with -Run
+    |
+    `--> installer process exits
+             |
+             v
+       AlcoholGuard runtime
+```
+
+### Install with debug mode
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -DebugMode
+```
+
+The scheduled task starts the runtime with `-Run -DebugMode`.
+
+### Manual runtime
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -Run
+```
+
+### Manual runtime with debug
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -Run -DebugMode
+```
+
+### Self-test
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -SelfTest
+```
+
+### Cleanup
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -CleanUp
+```
+
+### Flag combinations
+
+```powershell
+# Install + pass debug mode to the scheduled runtime
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -DebugMode
+
+# Run + debug
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -Run -DebugMode
+
+# Test only
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -SelfTest
+
+# Cleanup only
+powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard_v24.ps1 -CleanUp
+```
+
+`-Run`, `-CleanUp`, and `-SelfTest` are operational modes and are intended to be used separately. `-DebugMode` is the diagnostic modifier.
+
+## Windows runtime pipeline
+
+### 1. Runtime starts
+
+The GUI is created as a fullscreen, top-most WinForms overlay. A low-level keyboard hook blocks common escape paths while the overlay is locked.
+
+The implementation is a desktop overlay, not the Windows Secure Attention Sequence. A normal application cannot intercept `Ctrl+Alt+Del`.
+
+### 2. Arduino discovery
+
+The script does not hard-code `COM3`, `COM4`, or another port.
+
+It asks Windows PnP for present serial devices, ranks likely Arduino/CH340/USB-serial devices, opens candidates at `9600` baud, and accepts a candidate only after valid sensor output is available.
+
+For example:
+
+```text
+USB-SERIAL CH340 (COM3)
+USB Serial Device (COM5)
+Bluetooth COM Port (COM7)
+```
+
+The Arduino/CH340 candidate receives a higher priority and is verified by the `0..1023` serial data format.
+
+### 3. Sensor stabilization
+
+A new baseline is **not** taken immediately after the serial port is detected.
+
+The current logic treats clean air as an expected reading below:
+
+```text
+150
+```
+
+However, being below `150` is not enough by itself. A sliding window is checked for:
+
+- a small total span;
+- small first-to-last drift;
+- limited downward movement;
+- a final value still below the clean-air ceiling.
+
+This prevents a failure mode such as:
+
+```text
+100 -> 95 -> 90 -> 85 -> 80 -> 75 -> 70 -> 65
+```
+
+from becoming a false baseline merely because every value eventually became lower than `150`.
+
+High and slowly falling readings are treated as sensor warm-up/glitch conditions. The UI can ask the user to reconnect the sensor or touch/handle it to help it return to a stable state.
+
+### 4. Baseline calibration
+
+Once stabilization is accepted, the runtime collects a fresh calibration window for about ten seconds. The median of the collected samples becomes the new clean-air baseline.
+
+This baseline is recalculated for each new check and when `Refresh baseline & retest` is pressed.
+
+### 5. Breath detection
+
+The current sensor behavior observed during development is that a sober breath tends to move the MQ-3 reading downward.
+
+The runtime therefore watches for a suspicious downward movement. Once a possible breath starts, it observes the signal for up to five seconds and requires an actual downward trend rather than merely one or two noisy samples.
+
+The five-second observation was introduced to avoid the previous behavior where a `BreathDetected` state could sit for a long time waiting for the value to return to baseline.
+
+### 6. Alcohol threshold
+
+The current experimental rule is:
+
+```text
+alcohol_threshold = baseline + 200
+```
+
+with the ADC ceiling of `1023`.
+
+Examples:
+
+```text
+baseline = 45   -> threshold = 245
+baseline = 75   -> threshold = 275
+baseline = 100  -> threshold = 300
+baseline = 150  -> threshold = 350
+```
+
+This is a raw ADC threshold, not a blood-alcohol concentration measurement.
+
+### 7. Final decision
+
+A confirmed sober breath causes the overlay to unlock.
+
+If the observed signal reaches the alcohol threshold, the runtime enters `AlcoholDetected` and keeps the overlay locked.
+
+The master password is the emergency override:
+
+```text
+1989
+```
+
+### 8. New check
+
+The current development/test interval is **10 minutes**.
+
+After a successful unlock:
+
+```text
+Unlocked
+   |
+   +--> schedule next check in 600 seconds
+   |
+   v
+wait
+   |
+   v
+lock overlay
+   |
+   v
+reuse the connected sensor when possible
+   |
+   v
+stabilize again
+   |
+   v
+fresh baseline
+   |
+   v
+wait for breath
+```
+
+## Windows UI controls
+
+### Master password
+
+The password field is centered on the screen and provides the master-password override.
+
+### Refresh baseline & retest
+
+This is one combined operation:
+
+```text
+button press
+    |
+    v
+flush stale serial data
+    |
+    v
+stabilize sensor
+    |
+    v
+10-second calibration
+    |
+    v
+new baseline / thresholds
+    |
+    v
+start a new breath test immediately
+```
+
+## Windows logs
+
+The Windows implementation stores its own log under the user's local application-data directory, under an `AlcoholGuard` folder. Exact location can be changed in the script configuration.
+
+Debug mode also mirrors log messages to the PowerShell console.
+
+---
+
+# Linux
+
+## Linux implementation
+
+The Linux implementation is written in Python and uses Qt/PySide6 for the desktop UI and pyserial for Arduino communication.
+
+Repository variants:
+
+```text
+AlcoholBlocker_UI1_ControlPanel.py
+AlcoholBlocker_UI2_LargeStatus.py
+AlcoholBlocker_UI3_Cockpit.py
+```
+
+All three use the same sensor/decision logic and differ only in presentation.
+
+## Linux requirements
+
+- Linux graphical desktop session.
+- Python 3.10+ recommended.
+- PySide6.
+- pyserial.
+- Arduino-compatible board with an MQ-3 sensor.
+
+Arch Linux example:
+
+```bash
+sudo pacman -S python python-pyside6 python-pyserial
+```
+
+If distro packages are unavailable, use a virtual environment:
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install PySide6 pyserial
+```
+
+### Serial permissions
+
+Check the device:
+
+```bash
+ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
+```
+
+On Arch Linux the serial device is commonly controlled by the `uucp` group:
+
+```bash
+sudo usermod -aG uucp "$USER"
+```
+
+Log out and back in after changing group membership.
+
+## Linux command-line flags
+
+The Linux implementation supports:
+
+```text
+--debug
+--self-test
+--cleanup
+```
+
+### `--debug`
+
+Run the GUI with additional diagnostic information.
+
+```bash
+python3 AlcoholBlocker_UI3_Cockpit.py --debug
+```
+
+### `--self-test`
+
+Run algorithm/configuration tests without starting the GUI.
+
+```bash
+python3 AlcoholBlocker_UI1_ControlPanel.py --self-test
+```
+
+The tests are intended to work without a physical Arduino.
+
+### `--cleanup`
+
+Remove the application's own user-service/state artifacts according to the Linux implementation.
+
+```bash
+python3 AlcoholBlocker_UI1_ControlPanel.py --cleanup
+```
+
+## Linux launch examples
+
+### UI 1 — Control Panel
+
+```bash
+python3 AlcoholBlocker_UI1_ControlPanel.py
+python3 AlcoholBlocker_UI1_ControlPanel.py --debug
+python3 AlcoholBlocker_UI1_ControlPanel.py --self-test
+python3 AlcoholBlocker_UI1_ControlPanel.py --cleanup
+```
+
+### UI 2 — Large Status
+
+```bash
+python3 AlcoholBlocker_UI2_LargeStatus.py
+python3 AlcoholBlocker_UI2_LargeStatus.py --debug
+python3 AlcoholBlocker_UI2_LargeStatus.py --self-test
+python3 AlcoholBlocker_UI2_LargeStatus.py --cleanup
+```
+
+### UI 3 — Industrial / Cockpit
+
+```bash
+python3 AlcoholBlocker_UI3_Cockpit.py
+python3 AlcoholBlocker_UI3_Cockpit.py --debug
+python3 AlcoholBlocker_UI3_Cockpit.py --self-test
+python3 AlcoholBlocker_UI3_Cockpit.py --cleanup
+```
+
+There is no separate Linux `--run` flag in the Python versions: normal invocation is the runtime.
+
+## Linux pipeline
+
+The Linux pipeline is intentionally aligned with Windows:
+
+```text
+start application
+      |
+      v
+find Arduino / CH340 serial device
+      |
+      v
+open at 9600 baud
+      |
+      v
+stabilize sensor
+      |
+      v
+collect fresh baseline
+      |
+      v
+wait for breath
+      |
+      v
+observe downward breath event for up to 5 seconds
+      |
+      +----------------------+
+      |                      |
+      v                      v
+below alcohol limit      reaches baseline+200
+      |                      |
+      v                      v
+   unlock              AlcoholDetected
+```
+
+### Sensor discovery
+
+The Linux version scans available serial devices such as `/dev/ttyACM*` and `/dev/ttyUSB*`, ranks Arduino/CH340/USB-serial candidates, and validates candidates using the expected integer `0..1023` data stream.
+
+### Stabilization and baseline
+
+The same practical rules are used as on Windows: clean air is expected below `150`, slow downward drift is rejected, and a fresh ten-second median baseline is calculated only after the sensor appears stable.
+
+### Breath test
+
+A downward excursion is observed for up to five seconds. A stable/noisy signal is not enough. The purpose is to prevent the old long-lived `BreathDetected` condition from small fluctuations.
+
+### Alcohol threshold
+
+```text
+alcohol_threshold = baseline + 200
+```
+
+capped at `1023`.
+
+### Retest / baseline refresh
+
+The Linux UI uses one combined control:
+
+```text
+Refresh baseline & retest
+```
+
+It starts stabilization, recalculates the baseline, recalculates thresholds, and immediately starts another breath test.
+
+## Linux UI variants
+
+### UI 1 — Control Panel
+
+The most balanced layout. It keeps the diagnostic cards visible while giving the state message the main visual emphasis.
+
+### UI 2 — Large Status
+
+A minimal presentation dominated by the current state and sensor reading.
+
+### UI 3 — Industrial / Cockpit
+
+A denser instrument-panel presentation with live signal/trend information and more diagnostics.
+
+## Linux systemd user services
+
+Three service files are provided:
+
+```text
+alcoblocker-ui1.service
+alcoblocker-ui2.service
+alcoblocker-ui3.service
+```
+
+Example for UI3:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp alcoblocker-ui3.service ~/.config/systemd/user/alcoblocker-ui3.service
+systemctl --user daemon-reload
+systemctl --user enable --now alcoblocker-ui3.service
+```
+
+Check it with:
+
+```bash
+systemctl --user status alcoblocker-ui3.service
+journalctl --user -u alcoblocker-ui3.service -f
+```
+
+The service starts the application in the user's graphical session.
+
+## Linux logging
+
+The Linux implementation stores its own state/log information under the user's XDG state directory, typically:
+
+```text
+~/.local/state/alcoblocker/
+```
+
+If `XDG_STATE_HOME` is set, the application can use that base instead.
+
+`--cleanup` is intended to remove only project-created service/state artifacts. It does not erase system journals or unrelated OS telemetry.
+
+## Wayland / KDE limitations
+
+This is one of the biggest differences between the Windows and Linux implementations.
+
+The Linux application is a normal Qt desktop overlay. Under **Wayland**, the compositor deliberately controls global keyboard shortcuts and window-system security boundaries. A normal application cannot reliably install the same kind of system-wide low-level keyboard hook that the Windows implementation uses.
+
+That means the Linux version cannot guarantee blocking all of the following while the overlay is visible:
+
+- `Alt+Tab`.
+- `Meta` / Super shortcuts.
+- compositor-level `Ctrl+Alt+...` shortcuts.
+- switching to another workspace or virtual desktop.
+- other compositor-owned escape paths.
+
+A fullscreen/top-most Qt window is therefore **not equivalent to a real secure lock screen**.
+
+### X11
+
+On X11, applications have more control over keyboard grabs, so a stronger local kiosk-style overlay is possible. Even there, this project should not be treated as an operating-system secure lock implementation.
+
+### Wayland
+
+For a genuinely kiosk-like deployment on KDE/Wayland, combine ALCOBLOCKER with compositor/session-level kiosk controls or the desktop's own lock-screen mechanisms. The application itself should be considered the breath-check UI/control layer, not the security boundary.
+
+---
+
+# MIT License
+
+MIT is a permissive open-source license. It generally permits use, copying, modification, merging, publication, distribution, sublicensing, and selling of the software, including use inside proprietary products, provided the copyright and license notice are retained and the license terms are followed.
+
+It is permissive, but it is not literally "no restrictions": the copyright/license notice requirement and the warranty/liability disclaimer remain.
+
+See [LICENSE](LICENSE).
+
+# Project status
+
+ALCOBLOCKER is a hobby/experimental project for desktop automation and MQ-3 sensor experimentation. Sensor behavior is hardware-dependent and should be validated experimentally on the intended sensor before relying on any threshold.
