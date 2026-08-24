@@ -107,7 +107,7 @@ $BreathTrendMinimumDrop = 4.0
 $BreathTrendMinimumSteps = 2
 
 # Scheduled checking interval (10 minutes in current test configuration).
-$HourlyCheckSeconds = 600
+$HourlyCheckSeconds = 3600
 
 # Polling / reconnect.
 $UiTickMs = 100
