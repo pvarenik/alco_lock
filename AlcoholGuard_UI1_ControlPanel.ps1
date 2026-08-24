@@ -1671,13 +1671,13 @@ function Invoke-SelfTest {
     $flatDrop = $obsFlat[0] - ($obsFlat | Measure-Object -Minimum).Minimum
     $flatSteps = 0
     for ($i = 1; $i -lt $obsFlat.Count; $i++) { if ($obsFlat[$i] -lt $obsFlat[$i-1]) { $flatSteps++ } }
-    Assert-Test 'Flat/noisy readings do not confirm breath' -not ($flatDrop -ge $BreathTrendMinimumDrop -and $flatSteps -ge $BreathTrendMinimumSteps)
+    Assert-Test 'Flat/noisy readings do not confirm breath' (-not ($flatDrop -ge $BreathTrendMinimumDrop -and $flatSteps -ge $BreathTrendMinimumSteps))
 
     $obsRise = @(75,70,72,78,80,82)
     $riseDrop = $obsRise[0] - ($obsRise | Measure-Object -Minimum).Minimum
     $riseSteps = 0
     for ($i = 1; $i -lt $obsRise.Count; $i++) { if ($obsRise[$i] -lt $obsRise[$i-1]) { $riseSteps++ } }
-    Assert-Test 'Readings that fall then rise are not treated as a sustained downward breath' -not ($riseDrop -ge $BreathTrendMinimumDrop -and $riseSteps -ge $BreathTrendMinimumSteps)
+    Assert-Test 'Readings that fall then rise are not treated as a sustained downward breath' (-not ($riseDrop -ge $BreathTrendMinimumDrop -and $riseSteps -ge $BreathTrendMinimumSteps))
 
     Assert-Test 'Breath observation window is 5 seconds' ($BreathObservationSeconds -eq 5)
 
