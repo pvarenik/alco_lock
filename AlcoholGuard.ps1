@@ -1041,6 +1041,13 @@ function Update-Ui {
             $script:BaselineLabel.Text = '-'
         }
 
+        if ($null -ne $script:AlcoholThreshold) {
+            $script:AlcoholValueLabel.Text = "$([Math]::Round([double]$script:AlcoholThreshold,0))"
+        }
+        else {
+            $script:AlcoholValueLabel.Text = '-'
+        }
+
         if ($null -ne $script:BreathUpperThreshold -and $null -ne $script:BreathLowerThreshold) {
             $script:ThresholdLabel.Text = "$($script:BreathLowerThreshold)  ..  $($script:BreathUpperThreshold)"
         }
