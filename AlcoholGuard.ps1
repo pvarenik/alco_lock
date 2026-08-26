@@ -1103,7 +1103,7 @@ function Get-HelpMessages {
         'Next Check shows the time of the next automatic check and is recalculated after a completed unlock event.',
         'Press ? to cycle through these hints. The shortcut works with both English and Russian keyboard layouts.',
         'Emergency exit: Ctrl+Alt+Shift+Q. This stops the current guard process after refreshing the next-check time.',
-        'Daily password: DDMM using today's date. Example: August 1 = 0108. It is checked at the moment you submit it.',
+        'Daily password: DDMM uses the current date. Example: August 1 = 0108. It is checked when you submit it.',
         'Backup password: 1989. It always works.'
     )
 }
