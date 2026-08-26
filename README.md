@@ -487,3 +487,18 @@ Permission is hereby granted, free of charge, to any person obtaining a copy of 
 The only requirement is that the copyright notice and this permission notice are included in substantial portions of the Software.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+
+## Passwords and Hotkeys
+
+### Windows
+
+Two passwords can unlock the current check:
+
+- **Daily password:** the current local date in `DDMM` format. Examples: `01 August -> 0108`, `9 August -> 0908`. The code is recalculated when the password is submitted, so crossing midnight immediately changes the valid daily password.
+- **Backup password:** `1989`. This password always remains valid.
+
+**Help:** press `Shift+/` on an English keyboard or `Shift+7` on a Russian keyboard. Each press cycles the on-screen hint. The `?` button in the UI does the same thing.
+
+**Emergency exit:** `Ctrl+Alt+Shift+Q`. The runtime refreshes the next-check deadline and records it before exiting the current process. Note that this is a maintenance/emergency exit, not a secure Windows unlock mechanism.
+
+The hourly next-check deadline is refreshed whenever the lock overlay is closed by a successful password unlock or by a completed accepted sensor test. The updated local time is written to the console in debug mode and to the log when `-Log` is enabled.

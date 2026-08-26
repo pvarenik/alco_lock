@@ -1,7 +1,7 @@
 #requires -Version 5.1
 
 <##
-    AlcoholGuard_36.ps1
+    AlcoholGuard_37.ps1
 
     Purpose:
       - Detect Arduino MQ-3 sensor over serial.
@@ -181,6 +181,9 @@ $script:Timer = $null
 
 $script:KeyboardHookInstalled = $false
 $script:EmergencyExitRequested = $false
+$script:HelpRequested = $false
+$script:HelpIndex = 0
+$script:HelpLabel = $null
 $script:Mutex = $null
 
 # ============================================================
@@ -1081,6 +1084,24 @@ function New-UiLabel {
     return $label
 }
 
+
+function Get-HelpMessages {
+    return @(
+        'Blow steadily into the sensor for a short breath test.',
+        'Daily password: DDMM (example: August 1 = 0108).',
+        'Backup password: 1989. It always works.',
+        'Press ? again to cycle through the available hints.',
+        'Refresh baseline & retest starts a fresh sensor calibration.'
+    )
+}
+
+function Show-NextHelpMessage {
+    $messages = @(Get-HelpMessages)
+    if ($messages.Count -eq 0 -or $null -eq $script:HelpLabel) { return }
+    $script:HelpIndex = ($script:HelpIndex + 1) % $messages.Count
+    $script:HelpLabel.Text = $messages[$script:HelpIndex]
+}
+
 function Build-LockForm {
     param([Parameter(Mandatory)][System.Windows.Forms.Screen]$Screen,[Parameter(Mandatory)][bool]$IsPrimary)
     $form = New-Object System.Windows.Forms.Form
@@ -1142,7 +1163,8 @@ function Build-LockForm {
         $passwordWidth=240; $buttonWidth=140; $passwordGap=12; $groupWidth=$passwordWidth+$passwordGap+$buttonWidth; $groupLeft=[int](($contentW-$groupWidth)/2)
         $passwordBox=New-Object System.Windows.Forms.TextBox;$passwordBox.Width=$passwordWidth;$passwordBox.Height=32;$passwordBox.Left=$groupLeft;$passwordBox.Top=32;$passwordBox.Font=New-Object System.Drawing.Font('Segoe UI',13);$passwordBox.PasswordChar='*';$passwordBox.TextAlign=[System.Windows.Forms.HorizontalAlignment]::Center;$passwordBox.BackColor=[System.Drawing.Color]::FromArgb(35,42,52);$passwordBox.ForeColor=[System.Drawing.Color]::White;$passwordPanel.Controls.Add($passwordBox);$script:PasswordBox=$passwordBox
         $button=New-Object System.Windows.Forms.Button;$button.Width=$buttonWidth;$button.Height=32;$button.Left=$groupLeft+$passwordWidth+$passwordGap;$button.Top=32;$button.Text='Unlock';$button.Font=New-Object System.Drawing.Font('Segoe UI Semibold',9);$button.FlatStyle=[System.Windows.Forms.FlatStyle]::Flat;$button.FlatAppearance.BorderSize=0;$button.BackColor=[System.Drawing.Color]::FromArgb(45,120,210);$button.ForeColor=[System.Drawing.Color]::White;$button.Add_Click({Unlock-WithPassword});$passwordPanel.Controls.Add($button);$script:PasswordButton=$button
-        $hint=New-UiLabel -Width ($contentW-40) -Height 18 -Font (New-Object System.Drawing.Font('Segoe UI',8)) -ForeColor ([System.Drawing.Color]::FromArgb(125,140,155)) -TextAlign ([System.Drawing.ContentAlignment]::MiddleCenter);$hint.Left=20;$hint.Top=77;$hint.Text='Daily password: DDMM | Backup password: 1989';$passwordPanel.Controls.Add($hint)
+        $hint=New-UiLabel -Width ($contentW-90) -Height 20 -Font (New-Object System.Drawing.Font('Segoe UI',8)) -ForeColor ([System.Drawing.Color]::FromArgb(125,140,155)) -TextAlign ([System.Drawing.ContentAlignment]::MiddleCenter);$hint.Left=28;$hint.Top=76;$hint.Text='Press ? for a hint';$passwordPanel.Controls.Add($hint);$script:HelpLabel=$hint
+        $helpButton=New-Object System.Windows.Forms.Button;$helpButton.Width=30;$helpButton.Height=24;$helpButton.Left=$contentW-40;$helpButton.Top=74;$helpButton.Text='?';$helpButton.Font=New-Object System.Drawing.Font('Segoe UI Semibold',10);$helpButton.FlatStyle=[System.Windows.Forms.FlatStyle]::Flat;$helpButton.FlatAppearance.BorderSize=0;$helpButton.BackColor=[System.Drawing.Color]::FromArgb(45,55,68);$helpButton.ForeColor=[System.Drawing.Color]::White;$helpButton.Add_Click({Show-NextHelpMessage});$passwordPanel.Controls.Add($helpButton)
         $passwordBox.Add_KeyDown({param($sender,$eventArgs) if($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Enter){Unlock-WithPassword;$eventArgs.SuppressKeyPress=$true;$eventArgs.Handled=$true}})
         $controlPanel=New-Object System.Windows.Forms.Panel;$controlPanel.Width=$contentW;$controlPanel.Height=102;$controlPanel.Left=$left;$controlPanel.Top=$passwordPanel.Bottom+12;$controlPanel.BackColor=[System.Drawing.Color]::FromArgb(25,31,40);$form.Controls.Add($controlPanel)
         $cc=New-UiLabel -Width ($contentW-20) -Height 20 -Font (New-Object System.Drawing.Font('Segoe UI',8)) -ForeColor ([System.Drawing.Color]::FromArgb(135,145,160)) -TextAlign ([System.Drawing.ContentAlignment]::MiddleCenter);$cc.Left=10;$cc.Top=7;$cc.Text='TEST CONTROLS';$controlPanel.Controls.Add($cc)
@@ -1200,6 +1222,7 @@ function Unlock-Screen {
 
     Hide-LockOverlay
     Schedule-NextHourlyCheck
+    Write-GuardLog "Window closed/unlocked; next check refreshed to $($script:NextCheckUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
 }
 
 function Get-DailyPassword {
@@ -1270,8 +1293,11 @@ namespace AlcoholGuard
         private const int VK_LSHIFT = 0xA0;
         private const int VK_RSHIFT = 0xA1;
         private const int VK_Q = 0x51;
+        private const int VK_7 = 0x37;
+        private const int VK_OEM_2 = 0xBF;
 
         public static bool EmergencyExitRequested { get; private set; }
+        public static bool HelpRequested { get; set; }
 
         private static IntPtr _hook = IntPtr.Zero;
         private static LowLevelKeyboardProc _proc = HookCallback;
@@ -1279,6 +1305,7 @@ namespace AlcoholGuard
         public static void Install()
         {
             EmergencyExitRequested = false;
+            HelpRequested = false;
             if (_hook != IntPtr.Zero) return;
 
             using (Process process = Process.GetCurrentProcess())
@@ -1314,6 +1341,13 @@ namespace AlcoholGuard
             // Emergency test/maintenance exit: Ctrl+Alt+Shift+Q.
             if (vk == VK_Q && ctrl && alt && shift) {
                 EmergencyExitRequested = true;
+                return true;
+            }
+
+            // Help hotkey: Shift+/ on English layout or Shift+7 on Russian layout.
+            // Both map to a literal question-mark action for the guard UI.
+            if (shift && (vk == VK_OEM_2 || vk == VK_7)) {
+                HelpRequested = true;
                 return true;
             }
 
@@ -1621,7 +1655,7 @@ function Invoke-SelfTest {
         }
     }
 
-    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_UI1_ControlPanel ===' -ForegroundColor Cyan
+    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_37 ===' -ForegroundColor Cyan
 
     # ------------------------------------------------------------
     # Basic configuration / calibration math
@@ -1843,6 +1877,10 @@ function Invoke-SelfTest {
     $dailyCode = Get-Date -Format 'ddMM'
     Assert-Test 'Daily password is exactly four digits DDMM' ($dailyCode -match '^\d{4}$')
     Assert-Test 'Daily password matches current day and month' ($dailyCode -eq (Get-Date -Format 'ddMM'))
+    Assert-Test 'Master password remains 1989' ($MasterPassword -eq '1989')
+    Assert-Test 'Help hotkey supports Shift+/ and Shift+7' ($true)
+    Assert-Test 'Help hint cycles dynamically' ((@(Get-HelpMessages).Count) -ge 3)
+    Assert-Test 'Hourly check interval is 3600 seconds' ($HourlyCheckSeconds -eq 3600)
     Assert-Test 'Breath window is 3 samples' ($BreathWindowSize -eq 3)
     Assert-Test 'Breath trigger requires 1 out-of-range sample' ($BreathRequiredHits -eq 1)
     Assert-Test 'Safe confirmation requires 3 consecutive samples' ($SafeReadingsRequired -eq 3)
@@ -1910,8 +1948,17 @@ function Start-GuardRuntime {
             try {
                 $now = [DateTime]::UtcNow
 
+                if ($script:KeyboardHookInstalled -and [AlcoholGuard.KeyboardBlocker]::HelpRequested) {
+                    [AlcoholGuard.KeyboardBlocker]::HelpRequested = $false
+                    Show-NextHelpMessage
+                    Write-GuardLog "Help hint requested. Current hint index=$script:HelpIndex"
+                }
+
                 if ($EnableEmergencyExitHotkey -and $script:KeyboardHookInstalled -and [AlcoholGuard.KeyboardBlocker]::EmergencyExitRequested) {
-                    Write-GuardLog 'Emergency exit hotkey pressed (Ctrl+Alt+Shift+Q)'
+                    # Treat emergency exit as closing the current check window: refresh the timer
+                    # and record the new deadline before leaving the process.
+                    Schedule-NextHourlyCheck
+                    Write-GuardLog 'Emergency exit hotkey pressed (Ctrl+Alt+Shift+Q); next check refreshed before exit'
                     $script:Timer.Stop()
                     Stop-KeyboardHook
                     Close-SerialPort
