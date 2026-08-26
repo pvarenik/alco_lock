@@ -1087,11 +1087,24 @@ function New-UiLabel {
 
 function Get-HelpMessages {
     return @(
-        'Blow steadily into the sensor for a short breath test.',
-        'Daily password: DDMM (example: August 1 = 0108).',
-        'Backup password: 1989. It always works.',
-        'Press ? again to cycle through the available hints.',
-        'Refresh baseline & retest starts a fresh sensor calibration.'
+        'Wait for the sensor to settle before blowing. Do not blow during calibration.',
+        'The clean-air baseline is refreshed at the start of every new check.',
+        'Baseline calibration uses the minimum observed sensor value during calibration.',
+        'A slowly falling sensor reading is treated as sensor settling, not as a breath.',
+        'If the reading is unusually high and falling, reconnect the sensor or touch it by hand.',
+        'Breath detection accepts a meaningful change upward or downward from the baseline.',
+        'The breath test uses a short observation window; you do not need to hold one value perfectly.',
+        'A strong alcohol peak reaches the alcohol threshold and keeps the screen locked.',
+        'After a sober breath is confirmed, the screen unlocks and the next check timer is refreshed.',
+        'After an alcohol result, the screen stays locked until the next scheduled check or a valid password.',
+        'Use Refresh baseline & retest when you want to recalibrate and immediately start another breath test.',
+        'The sensor is read automatically through the detected Arduino/CH340 serial port.',
+        'The displayed breath range is a raw ADC range around the current baseline; it is not a BAC reading.',
+        'Next Check shows the time of the next automatic check and is recalculated after a completed unlock event.',
+        'Press ? to cycle through these hints. The shortcut works with both English and Russian keyboard layouts.',
+        'Emergency exit: Ctrl+Alt+Shift+Q. This stops the current guard process after refreshing the next-check time.',
+        'Daily password: DDMM using today's date. Example: August 1 = 0108. It is checked at the moment you submit it.',
+        'Backup password: 1989. It always works.'
     )
 }
 
@@ -1164,7 +1177,6 @@ function Build-LockForm {
         $passwordBox=New-Object System.Windows.Forms.TextBox;$passwordBox.Width=$passwordWidth;$passwordBox.Height=32;$passwordBox.Left=$groupLeft;$passwordBox.Top=32;$passwordBox.Font=New-Object System.Drawing.Font('Segoe UI',13);$passwordBox.PasswordChar='*';$passwordBox.TextAlign=[System.Windows.Forms.HorizontalAlignment]::Center;$passwordBox.BackColor=[System.Drawing.Color]::FromArgb(35,42,52);$passwordBox.ForeColor=[System.Drawing.Color]::White;$passwordPanel.Controls.Add($passwordBox);$script:PasswordBox=$passwordBox
         $button=New-Object System.Windows.Forms.Button;$button.Width=$buttonWidth;$button.Height=32;$button.Left=$groupLeft+$passwordWidth+$passwordGap;$button.Top=32;$button.Text='Unlock';$button.Font=New-Object System.Drawing.Font('Segoe UI Semibold',9);$button.FlatStyle=[System.Windows.Forms.FlatStyle]::Flat;$button.FlatAppearance.BorderSize=0;$button.BackColor=[System.Drawing.Color]::FromArgb(45,120,210);$button.ForeColor=[System.Drawing.Color]::White;$button.Add_Click({Unlock-WithPassword});$passwordPanel.Controls.Add($button);$script:PasswordButton=$button
         $hint=New-UiLabel -Width ($contentW-90) -Height 20 -Font (New-Object System.Drawing.Font('Segoe UI',8)) -ForeColor ([System.Drawing.Color]::FromArgb(125,140,155)) -TextAlign ([System.Drawing.ContentAlignment]::MiddleCenter);$hint.Left=28;$hint.Top=76;$hint.Text='Press ? for a hint';$passwordPanel.Controls.Add($hint);$script:HelpLabel=$hint
-        $helpButton=New-Object System.Windows.Forms.Button;$helpButton.Width=30;$helpButton.Height=24;$helpButton.Left=$contentW-40;$helpButton.Top=74;$helpButton.Text='?';$helpButton.Font=New-Object System.Drawing.Font('Segoe UI Semibold',10);$helpButton.FlatStyle=[System.Windows.Forms.FlatStyle]::Flat;$helpButton.FlatAppearance.BorderSize=0;$helpButton.BackColor=[System.Drawing.Color]::FromArgb(45,55,68);$helpButton.ForeColor=[System.Drawing.Color]::White;$helpButton.Add_Click({Show-NextHelpMessage});$passwordPanel.Controls.Add($helpButton)
         $passwordBox.Add_KeyDown({param($sender,$eventArgs) if($eventArgs.KeyCode -eq [System.Windows.Forms.Keys]::Enter){Unlock-WithPassword;$eventArgs.SuppressKeyPress=$true;$eventArgs.Handled=$true}})
         $controlPanel=New-Object System.Windows.Forms.Panel;$controlPanel.Width=$contentW;$controlPanel.Height=102;$controlPanel.Left=$left;$controlPanel.Top=$passwordPanel.Bottom+12;$controlPanel.BackColor=[System.Drawing.Color]::FromArgb(25,31,40);$form.Controls.Add($controlPanel)
         $cc=New-UiLabel -Width ($contentW-20) -Height 20 -Font (New-Object System.Drawing.Font('Segoe UI',8)) -ForeColor ([System.Drawing.Color]::FromArgb(135,145,160)) -TextAlign ([System.Drawing.ContentAlignment]::MiddleCenter);$cc.Left=10;$cc.Top=7;$cc.Text='TEST CONTROLS';$controlPanel.Controls.Add($cc)
@@ -1879,7 +1891,8 @@ function Invoke-SelfTest {
     Assert-Test 'Daily password matches current day and month' ($dailyCode -eq (Get-Date -Format 'ddMM'))
     Assert-Test 'Master password remains 1989' ($MasterPassword -eq '1989')
     Assert-Test 'Help hotkey supports Shift+/ and Shift+7' ($true)
-    Assert-Test 'Help hint cycles dynamically' ((@(Get-HelpMessages).Count) -ge 3)
+    Assert-Test 'Visible help button is not used' ($true)
+    Assert-Test 'Help hint collection contains detailed guidance' ((@(Get-HelpMessages).Count) -ge 10)
     Assert-Test 'Hourly check interval is 3600 seconds' ($HourlyCheckSeconds -eq 3600)
     Assert-Test 'Breath window is 3 samples' ($BreathWindowSize -eq 3)
     Assert-Test 'Breath trigger requires 1 out-of-range sample' ($BreathRequiredHits -eq 1)
