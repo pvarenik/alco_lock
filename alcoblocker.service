@@ -1,0 +1,13 @@
+[Unit]
+Description=ALCOBLOCKER Linux breath check
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/AlcoholBlocker
+ExecStart=/usr/bin/python3 %h/AlcoholBlocker/AlcoholBlocker.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
