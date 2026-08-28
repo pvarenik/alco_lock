@@ -168,10 +168,11 @@ When the threshold is reached, the state becomes `AlcoholDetected` and the scree
 
 ## Passwords
 
-Two passwords are accepted:
+Three passwords are accepted:
 
 - **Daily password:** local date in `DDMM` format. Examples: `01 August -> 0108`, `9 August -> 0908`.
 - **Backup password:** `1989`, always valid.
+- **Cleanup password:** `cleanup`. This is an emergency shutdown password. It starts the same `-CleanUp` path used by the command-line cleanup mode: the guard process is terminated, the `AlcoholBreathGuard` scheduled task is removed, and AlcoholGuard-owned launcher/log artifacts are deleted.
 
 The daily password is recalculated at the moment of submission, so crossing midnight immediately changes the valid daily password.
 
@@ -303,6 +304,14 @@ After updating the program:
 cp AlcoholBlocker.py ~/.local/bin/AlcoholBlocker.py
 systemctl --user restart alcoblocker.service
 ```
+
+## Linux passwords and cleanup
+
+Linux accepts the same three passwords:
+
+- `DDMM` — current local day and month, always four digits.
+- `1989` — permanent backup password.
+- `cleanup` — emergency cleanup password. Entering it exits the GUI and runs the same cleanup routine as `python3 AlcoholBlocker.py --cleanup`: the user service is stopped/disabled and AlcoholBlocker-owned state/log data is removed.
 
 ## Linux algorithm
 

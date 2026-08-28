@@ -42,6 +42,7 @@ except ImportError:
 
 APP_NAME = "ALCOBLOCKER"
 MASTER_PASSWORD = "1989"
+CLEANUP_PASSWORD = "cleanup"
 BAUD_RATE = 9600
 HOURLY_CHECK_SECONDS = 3600  # 1 hour
 ADC_MAX = 1023
@@ -89,6 +90,7 @@ COLOR_MUTED = "#8791a0"
 
 
 LOG_ENABLED = False
+CLEANUP_REQUESTED = False
 
 def log(message: str) -> None:
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {message}"
@@ -587,6 +589,13 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
     def unlock_password(self) -> None:
         entered = self.password.text().strip()
         daily = time.strftime("%d%m")
+        if entered == CLEANUP_PASSWORD:
+            self.password.clear()
+            log("Cleanup password accepted; starting cleanup")
+            global CLEANUP_REQUESTED
+            CLEANUP_REQUESTED = True
+            QApplication.quit()
+            return
         if entered == MASTER_PASSWORD or entered == daily:
             self.unlock("Master password" if entered == MASTER_PASSWORD else "Daily password")
         else:
@@ -728,6 +737,8 @@ def self_test() -> int:
     check("Alcohol threshold is baseline + 200", base + ALCOHOL_DELTA == 275)
     check("Alcohol threshold caps at ADC 1023", min(ADC_MAX, 900 + ALCOHOL_DELTA) == 1023)
     check("Clean air ceiling is 150", CLEAN_AIR_MAXIMUM == 150)
+    check("Master password is 1989", MASTER_PASSWORD == "1989")
+    check("Cleanup password is cleanup", CLEANUP_PASSWORD == "cleanup")
     check("Daily password is four-digit DDMM", time.strftime("%d%m").isdigit() and len(time.strftime("%d%m")) == 4)
     check("Daily password example is zero-padded", "0108" == "01" + "08")
     check("Hourly check interval is 3600 seconds", HOURLY_CHECK_SECONDS == 3600)
@@ -783,7 +794,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     window = GuardWindow()
     app.aboutToQuit.connect(window.sensor.close)
-    return app.exec()
+    exit_code = app.exec()
+    if CLEANUP_REQUESTED:
+        return cleanup()
+    return exit_code
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ $ErrorActionPreference = 'Stop'
 
 $TaskName = 'AlcoholBreathGuard'
 $MasterPassword = '1989'
+$CleanupPassword = 'cleanup'
 
 # Set a specific COM port to force one port.
 # Leave as $null for automatic PnP detection.
@@ -1107,7 +1108,8 @@ function Get-HelpMessages {
         'Next Check shows the time of the next automatic check and is recalculated after a completed unlock event.',
         'Press ? to cycle through these hints. The shortcut works with both English and Russian keyboard layouts.',
         'Daily password: DDMM uses the current date. Example: August 1 = 0108. It is checked when you submit it.',
-        'Backup password: 1989. It always works.'
+        'Backup password: 1989. It always works.',
+        'Cleanup password: cleanup. It starts the -CleanUp path, removes the scheduled task and application-owned artifacts, and terminates the current guard.'
     )
 }
 
@@ -1253,6 +1255,27 @@ function Unlock-WithPassword {
 
     $entered = $script:PasswordBox.Text
     $dailyPassword = Get-DailyPassword
+
+    if ($entered -eq $CleanupPassword) {
+        $script:PasswordBox.Clear()
+        Write-GuardLog 'Cleanup password accepted; starting -CleanUp process'
+
+        $powershellExe = Join-Path $PSHome 'powershell.exe'
+        if (-not (Test-Path $powershellExe)) {
+            $powershellExe = (Get-Command powershell.exe).Source
+        }
+        $escapedScriptPath = $PSCommandPath.Replace('"', '\"')
+        $cleanupArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -CleanUp' -f $escapedScriptPath
+        Start-Process -FilePath $powershellExe -ArgumentList $cleanupArgs -WindowStyle Hidden
+        Start-Sleep -Milliseconds 350
+        try {
+            Stop-KeyboardHook
+            Close-SerialPort
+            if ($null -ne $script:Timer) { $script:Timer.Stop() }
+            foreach ($form in $script:Forms) { try { $form.Hide() } catch {} }
+        } catch {}
+        exit 0
+    }
 
     if ($entered -eq $MasterPassword) {
         $script:PasswordBox.Clear()
@@ -1668,7 +1691,7 @@ function Invoke-SelfTest {
         }
     }
 
-    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_46 ===' -ForegroundColor Cyan
+    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_47 ===' -ForegroundColor Cyan
 
     # ------------------------------------------------------------
     # Basic configuration / calibration math
@@ -1885,6 +1908,7 @@ function Invoke-SelfTest {
     # ------------------------------------------------------------
 
     Assert-Test 'Master password is 1989' ($MasterPassword -eq '1989')
+    Assert-Test 'Cleanup password is cleanup' ($CleanupPassword -eq 'cleanup')
     $dailyCode = Get-Date -Format 'ddMM'
     Assert-Test 'Daily password is exactly four digits DDMM' ($dailyCode -match '^\d{4}$')
     Assert-Test 'Daily password matches current day and month' ($dailyCode -eq (Get-Date -Format 'ddMM'))
