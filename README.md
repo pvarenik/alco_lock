@@ -44,12 +44,11 @@ python3 AlcoholBlocker.py --self-test
 
 ## Files
 
-- `AlcoholGuard_46.ps1` — final Windows implementation.
+- `AlcoholGuard.ps1` — final Windows implementation.
 - `README.md` — documentation.
 - `LICENSE` — MIT license.
 - `alco_sensor.ino` — Arduino/MQ-3 sketch.
 
-Examples below intentionally use the stable public name `AlcoholGuard.ps1` rather than the versioned release filename.
 
 ## Flags
 
