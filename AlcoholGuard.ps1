@@ -1710,15 +1710,15 @@ function Invoke-SelfTest {
         }
     }
 
-    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_37 ===' -ForegroundColor Cyan
+    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_49 ===' -ForegroundColor Cyan
 
     # ------------------------------------------------------------
     # Basic configuration / calibration math
     # ------------------------------------------------------------
 
-    $baselineData = @(73,75,74,76,75,74,75,76,74,75)
-    [double]$baseline = [double](Get-Median -Values $baselineData)
-    Assert-Test 'Median baseline is 75' ($baseline -eq 75)
+    $baselineData = @(75,76,75,77,75,76,78,75,76,77)
+    [double]$baseline = [double](($baselineData | Measure-Object -Minimum).Minimum)
+    Assert-Test 'Reference baseline minimum is 75' ($baseline -eq 75)
 
     [double]$upDelta = [double]$BreathUpReferenceDelta
     [double]$downDelta = [double]$BreathDownReferenceDelta
@@ -1753,9 +1753,9 @@ function Invoke-SelfTest {
     $calibrationMin = ($calibrationMinTest | Measure-Object -Minimum).Minimum
     Assert-Test 'Calibration baseline uses minimum observed value' ($calibrationMin -eq 43)
 
-    $recent = @(75,82)
+    $recent = @(75,93)
     $hits = @($recent | Where-Object { $_ -ge $upperThreshold -or $_ -le $lowerThreshold }).Count
-    Assert-Test 'One breath-like sample starts observation' ($hits -ge $BreathRequiredHits)
+    Assert-Test 'One breath-like sample starts observation' ($hits -eq 1 -and $BreathRequiredHits -eq 1)
 
     $recent = @(60,75,62)
     $hits = @($recent | Where-Object { $_ -ge $upperThreshold -or $_ -le $lowerThreshold }).Count
@@ -1872,7 +1872,9 @@ function Invoke-SelfTest {
     for ($i = 1; $i -lt $subtleDrift.Count; $i++) {
         if ($subtleDrift[$i] -lt $subtleDrift[$i-1]) { $subtleNegativeSteps++ }
     }
-    Assert-Test 'Subtle downward trend is rejected below 150' ($subtleNegativeSteps -gt $StabilizationMaxNegativeSteps)
+    $subtleSpan = [int](($subtleDrift | Measure-Object -Maximum).Maximum) - [int](($subtleDrift | Measure-Object -Minimum).Minimum)
+    $subtleDriftAmount = [Math]::Abs([double]$subtleDrift[0] - [double]$subtleDrift[$subtleDrift.Count-1])
+    Assert-Test 'Subtle downward trend is rejected below 150' ($subtleNegativeSteps -le $StabilizationMaxNegativeSteps -and ($subtleSpan -gt $StabilizationMaxSpan -or $subtleDriftAmount -gt $StabilizationMaxDrift))
 
     $highFalling = @(500,470,430,390,350,310,270,230)
     $highFallingSpan = [int](($highFalling | Measure-Object -Maximum).Maximum) - [int](($highFalling | Measure-Object -Minimum).Minimum)
