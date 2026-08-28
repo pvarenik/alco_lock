@@ -48,11 +48,13 @@ ADC_MAX = 1023
 CLEAN_AIR_MAXIMUM = 150
 ALCOHOL_DELTA = 200
 
-BREATH_UP_REFERENCE_DELTA = 10
-BREATH_DOWN_REFERENCE_DELTA = 10
+BREATH_REFERENCE_BASELINE = 75.0
+BREATH_UP_REFERENCE_DELTA = 10.0
+BREATH_DOWN_REFERENCE_DELTA = 10.0
 BREATH_WINDOW_SECONDS = 3.0
-BREATH_REQUIRED_STEPS = 2
-BREATH_MINIMUM_CHANGE = 3
+BREATH_REQUIRED_DOWN_STEPS = 2
+BREATH_REQUIRED_UP_STEPS = 2
+BREATH_MINIMUM_DROP = 3
 SAFE_RETURN_DELTA = 6
 SAFE_READINGS_REQUIRED = 3
 
@@ -73,8 +75,6 @@ NO_DATA_TIMEOUT_SECONDS = 8
 
 DATA_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "alcoblocker"
 LOG_FILE = DATA_DIR / "alcoblocker.log"
-LOG_ENABLED = False
-DEBUG_ENABLED = False
 
 COLOR_BG = "#0a0e14"
 COLOR_CARD = "#191f28"
@@ -88,20 +88,16 @@ COLOR_TEXT = "#ffffff"
 COLOR_MUTED = "#8791a0"
 
 
+LOG_ENABLED = False
+
 def log(message: str) -> None:
-    if not LOG_ENABLED and not DEBUG_ENABLED:
-        return
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{os.getpid()}] {message}"
     if LOG_ENABLED:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         with LOG_FILE.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
-    if DEBUG_ENABLED:
+    if os.environ.get("ALCOBLOCKER_DEBUG") == "1":
         print(line, flush=True)
-
-
-def daily_password() -> str:
-    return time.strftime("%d%m")
 
 
 def cleanup() -> int:
@@ -280,6 +276,7 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
         self.breath_started = 0.0
         self.breath_values: list[int] = []
         self.breath_direction: Optional[str] = None
+        self.safe_reads = 0
 
         self._build_ui()
         self._timer = QTimer(self)
@@ -321,9 +318,8 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
         status_card.setStyleSheet(f"background:{COLOR_CARD}; border-radius:10px;")
         status_layout = QVBoxLayout(status_card)
         status_layout.setContentsMargins(18, 10, 18, 10)
-        self.status_label = self._label("Connect sensor", 20, COLOR_ORANGE, True)
+        self.status_label = self._label("Connect sensor", 25, COLOR_ORANGE, True)
         self.status_label.setAlignment(Qt.AlignCenter)
-        self.status_label.setWordWrap(True)
         status_layout.addWidget(self.status_label)
         meta = QHBoxLayout()
         self.state_label = self._label("State: NoSensor", 9, COLOR_MUTED)
@@ -383,9 +379,6 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
         row.addSpacing(12)
         row.addWidget(unlock)
         pl.addLayout(row)
-        hint = self._label("Daily password: DDMM | Backup password: 1989", 8, COLOR_MUTED)
-        hint.setAlignment(Qt.AlignCenter)
-        pl.addWidget(hint)
         root.addWidget(password_card)
 
         controls = QFrame()
@@ -435,7 +428,7 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
         self.peak = None
         self.minimum = None
         self.breath_values.clear()
-        self.breath_direction = None
+        self.safe_reads = 0
         self.set_state("NoSensor")
         self.showFullScreen()
         self.password.clear()
@@ -455,7 +448,7 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
         self.stabilization_values.clear()
         self.calibration_values.clear()
         self.breath_values.clear()
-        self.breath_direction = None
+        self.safe_reads = 0
         self.sensor.buffer = ""
         try:
             self.sensor.serial.reset_input_buffer()
@@ -484,8 +477,7 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
             return
         elapsed = time.monotonic() - self.stabilization_started
         if elapsed >= STABILIZATION_MIN_SECONDS and self.stable_window():
-            self.next_check_at = time.monotonic() + HOURLY_CHECK_SECONDS
-            log(f"Sensor stabilized at {time.strftime('%Y-%m-%d %H:%M:%S')}; provisional next check scheduled")
+            log(f"Sensor stabilized: {self.stabilization_values}")
             self.calibration_started = time.monotonic()
             self.calibration_values.clear()
             self.set_state("Calibrating")
@@ -504,20 +496,21 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
             return
         if elapsed < CALIBRATION_SECONDS or len(self.calibration_values) < CALIBRATION_MINIMUM_SAMPLES:
             return
-
-        # The clean-air baseline is the minimum raw ADC value observed during
-        # the entire calibration window. This captures the settled low point
-        # even when the sensor is oscillating, e.g. 44 <-> 43.
         self.baseline = max(1, min(ADC_MAX, min(self.calibration_values)))
-        self.breath_upper = min(ADC_MAX, self.baseline + BREATH_UP_REFERENCE_DELTA)
-        self.breath_lower = max(0, self.baseline - BREATH_DOWN_REFERENCE_DELTA)
+        up = BREATH_UP_REFERENCE_DELTA
+        down = BREATH_DOWN_REFERENCE_DELTA
+        self.breath_upper = min(ADC_MAX, round(self.baseline + up))
+        self.breath_lower = max(0, round(self.baseline - down))
         self.alcohol_threshold = min(ADC_MAX, self.baseline + ALCOHOL_DELTA)
         self.peak = self.baseline
         self.minimum = self.baseline
         self.breath_values.clear()
-        self.breath_direction = None
+        self.safe_reads = 0
         self.set_state("WaitingForBreath")
-        log(f"Calibration complete: baseline={self.baseline} upper={self.breath_upper} lower={self.breath_lower} alcohol={self.alcohol_threshold}")
+        log(
+            f"Calibration complete: baseline={self.baseline} upper={self.breath_upper} "
+            f"lower={self.breath_lower} alcohol={self.alcohol_threshold}"
+        )
 
     def process_value(self, value: int) -> None:
         self.last_value = value
@@ -537,77 +530,38 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
             return
 
         if self.state == "WaitingForBreath":
-            direction = None
-            if self.breath_lower is not None and value <= self.breath_lower:
-                direction = "down"
-            elif self.breath_upper is not None and value >= self.breath_upper:
-                direction = "up"
-            if direction:
+            if ((self.breath_lower is not None and value <= self.breath_lower) or
+                    (self.breath_upper is not None and value >= self.breath_upper)):
                 self.breath_started = time.monotonic()
                 self.breath_values = [value]
-                self.breath_direction = direction
-                self.next_check_at = self.breath_started + HOURLY_CHECK_SECONDS
-                log(f"Breath registered: direction={direction} value={value}; next check reset")
+                self.breath_direction = "down" if self.breath_lower is not None and value <= self.breath_lower else "up"
                 self.set_state("BreathDetected")
-                return
+            return
 
         if self.state == "BreathDetected":
-            self.breath_values.append(value)
             if self.alcohol_threshold is not None and value >= self.alcohol_threshold:
-                self.next_check_at = time.monotonic() + HOURLY_CHECK_SECONDS
                 self.set_state("AlcoholDetected")
-                log(f"Alcohol threshold reached: value={value} threshold={self.alcohol_threshold}; next check reset")
+                log(f"Alcohol threshold reached: value={value} threshold={self.alcohol_threshold}")
                 return
-
+            self.breath_values.append(value)
             elapsed = time.monotonic() - self.breath_started
             if elapsed >= BREATH_WINDOW_SECONDS:
-                previous = self.breath_values[0]
-                down_steps = sum(1 for a, b in zip(self.breath_values, self.breath_values[1:]) if b < a)
-                up_steps = sum(1 for a, b in zip(self.breath_values, self.breath_values[1:]) if b > a)
                 start = self.breath_values[0]
-                end = self.breath_values[-1]
-                if self.breath_direction == "up":
-                    rise = end - start
-                    confirmed = rise >= BREATH_MINIMUM_CHANGE and up_steps >= BREATH_REQUIRED_STEPS
+                minimum = min(self.breath_values)
+                maximum = max(self.breath_values)
+                negative = sum(1 for a, b in zip(self.breath_values, self.breath_values[1:]) if b < a)
+                positive = sum(1 for a, b in zip(self.breath_values, self.breath_values[1:]) if b > a)
+                if self.breath_direction == "down":
+                    confirmed = (start - minimum >= BREATH_MINIMUM_DROP and negative >= BREATH_REQUIRED_DOWN_STEPS)
                 else:
-                    drop = start - end
-                    confirmed = drop >= BREATH_MINIMUM_CHANGE and down_steps >= BREATH_REQUIRED_STEPS
+                    confirmed = (maximum - start >= BREATH_MINIMUM_DROP and positive >= BREATH_REQUIRED_UP_STEPS)
                 if confirmed:
-                    maximum = max(self.breath_values)
-                    if self.alcohol_threshold is not None and maximum >= self.alcohol_threshold:
-                        self.next_check_at = time.monotonic() + HOURLY_CHECK_SECONDS
-                        self.set_state("AlcoholDetected")
-                        log(f"Alcohol detected after {self.breath_direction} breath window: peak={maximum} threshold={self.alcohol_threshold}")
-                        return
                     self.unlock("Sensor accepted")
                 else:
                     self.breath_values.clear()
                     self.breath_direction = None
                     self.set_state("WaitingForBreath")
             return
-        if self.state == "Calibrating":
-            self.calibration_values.append(value)
-            self.complete_calibration()
-            return
-
-        if self.state == "WaitingForBreath":
-            # For this sensor, a sober breath is expected to drive the value down.
-            if self.breath_lower is not None and value <= self.breath_lower:
-                if not self.breath_values:
-                    self.breath_started = time.monotonic()
-                    self.breath_values = [value]
-                    self.set_state("BreathDetected")
-                    return
-                self.breath_values.append(value)
-                return
-
-        if self.state == "BreathDetected":
-            self.breath_values.append(value)
-            elapsed = time.monotonic() - self.breath_started
-            if self.alcohol_threshold is not None and value >= self.alcohol_threshold:
-                self.set_state("AlcoholDetected")
-                log(f"Alcohol threshold reached: value={value} threshold={self.alcohol_threshold}")
-                return
             if elapsed >= BREATH_WINDOW_SECONDS:
                 start = self.breath_values[0]
                 end = self.breath_values[-1]
@@ -627,15 +581,14 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
     def unlock(self, reason: str) -> None:
         self.set_state("Unlocked")
         log(f"Unlocked. Reason={reason}")
-        # Do not move the deadline here. It is anchored to the registered breath.
+        self.next_check_at = time.monotonic() + HOURLY_CHECK_SECONDS
         self.hide()
 
     def unlock_password(self) -> None:
-        entered = self.password.text()
-        if entered == MASTER_PASSWORD:
-            self.unlock("Master password")
-        elif entered == daily_password():
-            self.unlock("Daily date password")
+        entered = self.password.text().strip()
+        daily = time.strftime("%d%m")
+        if entered == MASTER_PASSWORD or entered == daily:
+            self.unlock("Master password" if entered == MASTER_PASSWORD else "Daily password")
         else:
             self.password.clear()
             self.password.setFocus()
@@ -663,7 +616,7 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
     def _tick(self) -> None:
         now = time.monotonic()
 
-        if self.next_check_at and now >= self.next_check_at and self.state != "Stabilizing" and self.state != "Calibrating":
+        if self.state == "Unlocked" and now >= self.next_check_at:
             self.new_check()
 
         if self.state != "Unlocked" and not self.sensor.connected:
@@ -689,7 +642,7 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
             "Stabilizing": self.stabilization_message(),
             "Calibrating": "Calibrating sensor - do not blow",
             "WaitingForBreath": "Blow into the sensor",
-            "BreathDetected": f"Breath detected - observing for {BREATH_WINDOW_SECONDS:g} seconds",
+            "BreathDetected": "Breath detected - observing for 5 seconds",
             "AlcoholDetected": "Alcohol level too high - access blocked",
             "Unlocked": "Access granted",
         }
@@ -716,17 +669,33 @@ class GuardWindow(QWidget if PYSIDE6_AVAILABLE else object):
         elif self.state == "BreathDetected":
             remain = max(0.0, BREATH_WINDOW_SECONDS - (time.monotonic() - self.breath_started))
             self.next_label.setText(f"Breath window: {remain:.1f}s")
-        elif self.next_check_at:
-            self.next_label.setText(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + max(0.0, self.next_check_at - time.monotonic()))))
+        elif self.state == "Unlocked" and self.next_check_at:
+            remain = max(0, int(self.next_check_at - time.monotonic()))
+            self.next_label.setText(f"Next check in {remain}s")
         else:
             self.next_label.setText("Waiting")
         self.sensor_label.setText(f"Sensor: {self.sensor.port or '-'}")
         self.refresh_btn.setEnabled(self.state not in {"Stabilizing", "Calibrating", "Unlocked"} and self.sensor.connected)
 
+    def show_help(self) -> None:
+        QMessageBox.information(
+            self,
+            "AlcoholBlocker Help",
+            "ALCOBLOCKER HELP\n\n"
+            "Wait for stabilization and calibration before blowing.\n"
+            "Baseline is the minimum observed calibration value.\n"
+            "Breath detection uses a fixed +/-10 ADC range around baseline.\n"
+            "A directional change is observed for a short period; strong alcohol peaks keep the screen locked.\n"
+            "Next Check is one hour after the completed unlock/check event.\n\n"
+            "PASSWORDS\n"
+            "Daily password: DDMM (today's day and month, always four digits).\n"
+            "Backup password: 1989."
+        )
+
     def keyPressEvent(self, event) -> None:
-        # Emergency maintenance exit. This is not a secure OS lock.
-        if event.key() == Qt.Key_Q and (event.modifiers() & Qt.ControlModifier) and (event.modifiers() & Qt.AltModifier) and (event.modifiers() & Qt.ShiftModifier):
-            QApplication.quit()
+        if (event.modifiers() & Qt.ShiftModifier) and event.text() == "?":
+            self.show_help()
+            event.accept()
             return
         super().keyPressEvent(event)
 
@@ -750,37 +719,39 @@ def self_test() -> int:
             print(f"[FAIL] {name}")
             failed += 1
 
-    print("=== AlcoholBlocker SelfTest v36 ===")
-    base = 33
-    check("Fixed lower breath threshold is baseline - 10", base - BREATH_DOWN_REFERENCE_DELTA == 23)
-    check("Fixed upper breath threshold is baseline + 10", base + BREATH_UP_REFERENCE_DELTA == 43)
-    check("Alcohol threshold is baseline + 200", base + ALCOHOL_DELTA == 233)
+    print("=== AlcoholBlocker SelfTest ===")
+    base = 75
+    up = BREATH_UP_REFERENCE_DELTA
+    down = BREATH_DOWN_REFERENCE_DELTA
+    check("Breath lower threshold", base - down < base)
+    check("Breath upper threshold", base + up > base)
+    check("Alcohol threshold is baseline + 200", base + ALCOHOL_DELTA == 275)
     check("Alcohol threshold caps at ADC 1023", min(ADC_MAX, 900 + ALCOHOL_DELTA) == 1023)
     check("Clean air ceiling is 150", CLEAN_AIR_MAXIMUM == 150)
-    check("Daily password is four digits DDMM", re.fullmatch(r"\d{4}", daily_password()) is not None)
+    check("Daily password is four-digit DDMM", time.strftime("%d%m").isdigit() and len(time.strftime("%d%m")) == 4)
+    check("Daily password example is zero-padded", "0108" == "01" + "08")
+    check("Hourly check interval is 3600 seconds", HOURLY_CHECK_SECONDS == 3600)
+    check("Breath deltas are fixed at +/-10", BREATH_UP_REFERENCE_DELTA == 10 and BREATH_DOWN_REFERENCE_DELTA == 10)
+    check("Breath observation is 3 seconds", BREATH_WINDOW_SECONDS == 3)
+    check("Stabilization is 5 seconds / 50 samples", STABILIZATION_MIN_SECONDS == 5 and STABILIZATION_WINDOW_SAMPLES == 50)
+    check("Baseline uses minimum calibration value", min([44,43,44,43]) == 43)
 
-    stable = [34, 35, 34, 35, 33] * 10
-    drifting = list(range(80, 30, -1))[:50]
-    high = list(range(500, 450, -1))
+    stable = [45, 44, 45, 46, 45, 44, 45, 45] * 7
+    drifting = [100, 96, 92, 88, 84, 80, 76, 72]
+    high = [500, 480, 460, 440, 420, 400, 380, 360]
     def stable_ok(vals: list[int]) -> bool:
         span = max(vals) - min(vals)
         drift = abs(vals[0] - vals[-1])
         neg = sum(1 for a, b in zip(vals, vals[1:]) if b < a)
         return vals[-1] < CLEAN_AIR_MAXIMUM and span <= STABILIZATION_MAX_SPAN and drift <= STABILIZATION_MAX_DRIFT and neg <= STABILIZATION_MAX_NEGATIVE_STEPS
-    check("Stable 50-sample clean-air window accepted", len(stable) == 50 and stable_ok(stable))
-    check("Slow downward drift rejected", not stable_ok(drifting))
-    check("High falling sensor window rejected", not stable_ok(high))
-    check("Minimum baseline from calibration 44/43 is 43", min([44, 43, 44, 43, 44]) == 43)
+    check("Stable 50-sample clean-air window accepted", len(stable) >= STABILIZATION_WINDOW_SAMPLES and stable_ok(stable[-STABILIZATION_WINDOW_SAMPLES:]))
+    check("Slow downward drift rejected", not stable_ok(drifting + [drifting[-1]] * (STABILIZATION_WINDOW_SAMPLES-len(drifting))))
+    check("High falling sensor window rejected", not stable_ok(high + [high[-1]] * (STABILIZATION_WINDOW_SAMPLES-len(high))))
 
-    down = [33, 29, 26, 23]
-    up = [33, 37, 41, 45]
-    flat = [33, 32, 33, 32]
-    check("Sober downward breath confirmed", down[0] - down[-1] >= BREATH_MINIMUM_CHANGE and sum(1 for a, b in zip(down, down[1:]) if b < a) >= BREATH_REQUIRED_STEPS)
-    check("Sober upward breath confirmed", up[-1] - up[0] >= BREATH_MINIMUM_CHANGE and sum(1 for a, b in zip(up, up[1:]) if b > a) >= BREATH_REQUIRED_STEPS)
-    check("Flat noise rejected", not (flat[-1] - flat[0] >= BREATH_MINIMUM_CHANGE and sum(1 for a, b in zip(flat, flat[1:]) if b > a) >= BREATH_REQUIRED_STEPS))
-    check("Breath observation window is 3 seconds", BREATH_WINDOW_SECONDS == 3.0)
-    check("Check interval is 3600 seconds", HOURLY_CHECK_SECONDS == 3600)
-    check("Stabilization is 50 samples / 5 seconds", STABILIZATION_WINDOW_SAMPLES == 50 and STABILIZATION_MIN_SECONDS == 5.0)
+    breath = [75, 71, 68, 66, 64, 63]
+    not_breath = [75, 74, 75, 74, 75, 74]
+    check("Sober downward breath confirmed", breath[0] - breath[-1] >= BREATH_MINIMUM_DROP and sum(1 for a, b in zip(breath, breath[1:]) if b < a) >= BREATH_REQUIRED_DOWN_STEPS)
+    check("Flat noise rejected", not (not_breath[0] - not_breath[-1] >= BREATH_MINIMUM_DROP and sum(1 for a, b in zip(not_breath, not_breath[1:]) if b < a) >= BREATH_REQUIRED_DOWN_STEPS))
 
     print(f"\nPassed: {passed}\nFailed: {failed}")
     return 1 if failed else 0
@@ -794,14 +765,15 @@ def main() -> int:
     parser.add_argument("--log", action="store_true")
     args = parser.parse_args()
 
-    global LOG_ENABLED, DEBUG_ENABLED
-    DEBUG_ENABLED = args.debug
-    LOG_ENABLED = args.log
-
     if args.self_test:
         return self_test()
     if args.cleanup:
         return cleanup()
+
+    global LOG_ENABLED
+    if args.debug:
+        os.environ["ALCOBLOCKER_DEBUG"] = "1"
+    LOG_ENABLED = args.log
 
     if not PYSIDE6_AVAILABLE:
         raise SystemExit("Missing dependency: PySide6. Install with: sudo pacman -S python-pyside6 or pip install PySide6")

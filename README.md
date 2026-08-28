@@ -1,81 +1,41 @@
 # ALCOBLOCKER
 
-ALCOBLOCKER is an experimental desktop breath-check project built around an Arduino Uno R3 and an MQ-3 sensor. It periodically presents a fullscreen overlay, establishes a fresh clean-air baseline, waits for a detected breath, and either unlocks the session or keeps it blocked when the configured raw alcohol threshold is reached.
+Experimental desktop breath-check project built around an Arduino Uno R3 and MQ-3 analog gas sensor.
 
-> **Important:** this is an experimental access-control project, not a certified breathalyzer and not a medical, legal, or forensic measurement device. MQ-3 raw ADC values are sensor- and hardware-dependent.
+> **Important:** ALCOBLOCKER is not a certified breathalyzer, medical device, legal/forensic measurement device, or secure operating-system lock. It uses raw MQ-3 ADC values and project-specific thresholds.
 
-## Quick Start
+## Quick start
 
 ### Windows
 
-The current Windows release artifact is `AlcoholGuard_36.ps1`. In the examples below the stable, unversioned public name `AlcoholGuard.ps1` is used, as intended for the README and releases.
-
-Self-test first:
+Run the self-test first:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -SelfTest
 ```
 
-Normal installation and start:
+Install/start normally:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1
 ```
 
-The command with **no parameters** installs or refreshes the `AlcoholBreathGuard` Task Scheduler task and immediately starts the hidden worker with `-Run`.
-
-Developer/debug run without installing the task:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -Run -DebugMode
-```
-
-Persistent logging is opt-in:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -Run -DebugMode -Log
-```
-
-Cleanup:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -CleanUp
-```
+The no-parameter command creates/updates the `AlcoholBreathGuard` scheduled task and starts the hidden runtime immediately.
 
 ### Linux
 
-The current Linux release artifact is `AlcoholBlocker_36.py`. The README examples intentionally use the stable, unversioned name `AlcoholBlocker.py`.
+> **Linux status:** the Linux implementation has **not been tested on real hardware in this project**. It is provided for educational, demonstration, theoretical, and experimental purposes only. Do not rely on it as a real screening system or secure lock without your own validation.
 
-> **Linux status:** the Linux implementation has **not been tested on real hardware in this project**. It is provided for educational, demonstration, theoretical, and experimental purposes only. Do not rely on it as a real screening or secure screen-locking system without your own validation.
-
-Self-test:
-
-```bash
-python3 AlcoholBlocker.py --self-test
-```
-
-Normal UI run:
+Install dependencies, then run:
 
 ```bash
 python3 AlcoholBlocker.py
 ```
 
-Debug output without a file log:
+Self-test:
 
 ```bash
-python3 AlcoholBlocker.py --debug
-```
-
-Persistent file logging:
-
-```bash
-python3 AlcoholBlocker.py --debug --log
-```
-
-Cleanup:
-
-```bash
-python3 AlcoholBlocker.py --cleanup
+python3 AlcoholBlocker.py --self-test
 ```
 
 ---
@@ -84,359 +44,293 @@ python3 AlcoholBlocker.py --cleanup
 
 ## Files
 
-- `AlcoholGuard_36.ps1` — current Windows release artifact.
-- `README.md` — project documentation.
+- `AlcoholGuard_46.ps1` — final Windows implementation.
+- `README.md` — documentation.
 - `LICENSE` — MIT license.
-- `alco_sensor.ino` — Arduino sketch.
+- `alco_sensor.ino` — Arduino/MQ-3 sketch.
 
-## Windows flags
+Examples below intentionally use the stable public name `AlcoholGuard.ps1` rather than the versioned release filename.
 
-| Flag | Purpose |
+## Flags
+
+| Flag | Meaning |
 |---|---|
-| no flag | Install/update the scheduled task and start a hidden `-Run` worker immediately |
-| `-Run` | Start the runtime directly without changing Task Scheduler |
-| `-SelfTest` | Run algorithm/configuration tests and exit |
-| `-CleanUp` | Stop other runtime processes, remove the scheduled task, and remove AlcoholGuard-owned artifacts |
+| no flag | Install/update scheduled task and start hidden runtime |
+| `-Run` | Run the guard directly without installing/updating the task |
+| `-SelfTest` | Run built-in tests and exit |
+| `-CleanUp` | Stop guard processes, remove scheduled task, and remove AlcoholGuard-owned artifacts |
 | `-DebugMode` | Print diagnostic messages to the console |
-| `-Log` | Enable persistent `AlcoholGuard.log` file logging; off by default |
+| `-Log` | Enable persistent file logging; disabled by default |
 
-`-DebugMode` does **not** create a log file by itself. Persistent logging requires `-Log`.
-
-## Windows launch examples
-
-Normal install/start:
+Examples:
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1
-```
-
-Install/start with console diagnostics:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -DebugMode
-```
-
-Install/start with persistent logs:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -Log
-```
-
-Install/start with both diagnostics and persistent logs:
-
-```powershell
-powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -DebugMode -Log
-```
-
-Direct runtime:
-
-```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -Run
-```
-
-Direct runtime with diagnostics:
-
-```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -Run -DebugMode
-```
-
-Direct runtime with diagnostics and logging:
-
-```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -Run -DebugMode -Log
-```
-
-Self-test:
-
-```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -SelfTest
-```
-
-Cleanup:
-
-```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\AlcoholGuard.ps1 -CleanUp
 ```
 
+`-DebugMode` does not create a persistent log file. Use `-Log` when a file is required.
+
 ## Windows startup pipeline
 
-### Launch with no parameters
-
 ```text
-AlcoholGuard.ps1
-    |
-    +--> create/update Scheduled Task: AlcoholBreathGuard
-    |
-    +--> create hidden launcher
-    |
-    +--> start hidden worker with -Run
-    |
-    +--> installer process exits
-             |
-             v
-       fullscreen runtime
-             |
-             v
-       find Arduino / CH340 automatically
-             |
-             v
-       stabilize clean-air signal
-             |
-             v
-       10-second calibration
-       baseline = minimum observed calibration value
-             |
-             v
-       waiting for breath
-             |
-             v
-       breath registered
-             |
-             +--> reset next-check deadline from breath time
-             |
-             v
-       3-second directional observation
-             |
-        +----+-------------------+
-        |                        |
-      sober                    alcohol
-        |                        |
-        v                        v
-     unlock              keep screen blocked
-                                  |
-                                  v
-                         reset next-check deadline
+install/update task
+       |
+       v
+hidden launcher
+       |
+       v
+runtime starts with -Run
+       |
+       v
+auto-detect Arduino / CH340
+       |
+       v
+sensor stabilization
+       |
+       v
+10-second calibration
+baseline = minimum observed calibration value
+       |
+       v
+waiting for breath
+       |
+       v
+one out-of-range reading starts breath observation
+       |
+       v
+3-second directional observation
+       |
+    +--+------------------+
+    |                     |
+  sober                 alcohol
+    |                     |
+    v                     v
+unlock              keep blocked
 ```
 
-## Windows sensor discovery
+## Serial sensor detection
 
-The script does not hard-code `COM3` or `COM4`. It uses Windows PnP serial-device information and prioritizes common Arduino/USB-UART identifiers such as `CH340`, `CH341`, `Arduino`, `USB-SERIAL`, `FTDI`, and `CP210`.
+The Windows implementation does not hard-code `COM3` or `COM4`. It searches Windows PnP serial devices and prioritizes Arduino/USB-UART identifiers such as `CH340`, `CH341`, `Arduino`, `USB-SERIAL`, `FTDI`, and `CP210`.
 
-The expected Arduino stream is:
+Expected stream:
 
 - `9600` baud;
 - one integer per line;
-- raw ADC value `0..1023`.
+- raw ADC `0..1023`.
 
-## Windows stabilization and calibration
+## Stabilization and calibration
 
-The current configuration is designed around the observed MQ-3 behavior used during development:
+Current tuning:
 
 - clean-air ceiling: `150`;
 - stabilization minimum: `5 seconds`;
-- stabilization window: `50 samples` at the current polling cadence;
-- maximum stabilization span: `6` raw ADC counts;
+- stabilization window: `50 samples`;
+- maximum stabilization span: `6` ADC counts;
 - maximum total drift: `3` counts;
-- maximum downward steps in the stabilization window: `20`;
+- maximum downward steps: `20`;
 - calibration: `10 seconds`;
-- baseline: **minimum value observed during the entire 10-second calibration**.
+- baseline: **minimum value observed during the complete calibration**.
 
-The minimum-based baseline is intentional. For a settled signal such as `44, 43, 44, 43, 44`, the baseline becomes `43` instead of `44`.
+A slowly falling signal is treated as sensor settling rather than clean air. When the sensor is abnormally high, the UI asks the user to reconnect the sensor or touch it by hand.
 
-A sensor that is still drifting down is rejected even when it has already fallen below the `150` clean-air ceiling.
+## Breath detection
 
-## Windows breath detection
-
-Breath detection uses a fixed range around the current baseline:
+The current fixed breath range is:
 
 ```text
 lower = baseline - 10
 upper = baseline + 10
 ```
 
-Both directions are supported because the observed sensor can react differently depending on the breath/test conditions.
+Both upward and downward responses are supported.
 
-A single out-of-range sample starts the observation. The observation window lasts **3 seconds**. The reading must show a directional change of at least `3` ADC counts and at least `2` steps in the same direction.
+One sample outside the range starts a breath observation. The observation lasts `3 seconds` and needs a directional change of at least `3` ADC counts with at least `2` same-direction steps.
 
-The UI derives the displayed observation time directly from the configuration, so the text does not become stale when the setting changes.
+The UI displays the real configured observation duration.
 
 ## Alcohol threshold
 
-The project uses a simple raw-ADC rule:
+The strong-response threshold is:
 
 ```text
 alcohol threshold = baseline + 200
 ```
 
-with an ADC ceiling of `1023`.
+capped at ADC maximum `1023`.
 
-This is deliberately a project-specific strong-response threshold, not a BAC or promille conversion.
+This is a raw project threshold, not a BAC/promille conversion.
 
-When the alcohol threshold is reached during a confirmed breath observation, the state becomes `AlcoholDetected`, the screen remains blocked, and the next-check deadline is reset from the moment the alcohol event is registered.
+When the threshold is reached, the state becomes `AlcoholDetected` and the screen remains blocked until another allowed unlock path or scheduled check.
 
 ## Passwords
 
-There are two valid unlock passwords:
+Two passwords are accepted:
 
-1. **Daily dynamic password:** current day + current month, always four digits, `DDMM`.
-   - January 8 → `0801`.
-   - August 1 → `0108`.
-2. **Permanent backup password:** `1989`.
+- **Daily password:** local date in `DDMM` format. Examples: `01 August -> 0108`, `9 August -> 0908`.
+- **Backup password:** `1989`, always valid.
 
-The daily password is recalculated at the moment the user submits the password. Therefore midnight is handled without restarting the program: after midnight, the new day's `DDMM` becomes valid immediately.
+The daily password is recalculated at the moment of submission, so crossing midnight immediately changes the valid daily password.
 
-## Next-check scheduling
+## Next check
 
-The `NEXT CHECK` field is updated at these points:
+The automatic interval is **3600 seconds / 1 hour**.
 
-1. when stabilization succeeds, an initial one-hour deadline is created;
-2. when a breath is registered, the one-hour deadline is recalculated from that breath timestamp;
-3. if the breath is later classified as alcohol, the deadline is recalculated again from the moment the alcohol event is registered.
+The `NEXT CHECK` deadline is refreshed when the relevant event occurs:
 
-This means a long stabilization period does not consume the entire next-check interval.
+- after stabilization establishes the current cycle;
+- when a breath is registered;
+- when a breath is classified as alcohol;
+- after successful password unlock.
 
-The current automatic interval is **3600 seconds / 1 hour**.
+The time is written to the console in debug mode and to the persistent log only when `-Log` is enabled.
 
 ## Refresh baseline & retest
 
-The single control button performs:
+The single button performs:
 
 ```text
-Refresh baseline & retest
-    -> stabilization
-    -> fresh 10-second calibration
+stabilization
+    -> 10-second calibration
     -> new minimum baseline
     -> new breath range
     -> new alcohol threshold
-    -> WaitingForBreath
+    -> waiting for breath
 ```
+
+## Help
+
+Press `Shift+/` on an English keyboard or `Shift+7` on a Russian keyboard to cycle through detailed help hints in the UI.
+
+There is no emergency/unlock hotkey.
 
 ## Logging
 
-Persistent logging is **disabled by default**.
+No persistent log is written by default.
 
-- `-DebugMode` prints diagnostics to the console.
-- `-Log` enables `%LOCALAPPDATA%\AlcoholGuard\AlcoholGuard.log`.
-- `-DebugMode -Log` does both.
+- `-DebugMode` -> console diagnostics.
+- `-Log` -> `%LOCALAPPDATA%\AlcoholGuard\AlcoholGuard.log`.
+- `-DebugMode -Log` -> both.
 
-Cleanup removes the application's own log file and launcher artifacts. It does not attempt to erase Windows Event Logs or unrelated operating-system telemetry.
+Cleanup removes the application's own log and launcher artifacts. It does not attempt to erase Windows Event Logs or unrelated OS telemetry.
 
 ## Scheduled task and hidden startup
 
-The installer creates the `AlcoholBreathGuard` task with an `AtLogOn` trigger. The scheduled task launches `wscript.exe`, which starts PowerShell with `-WindowStyle Hidden`. The intent is to avoid a normal PowerShell console/taskbar button being visible after reboot.
+The scheduled task uses an `AtLogOn` trigger. The task launches `wscript.exe`, which starts PowerShell with `-WindowStyle Hidden`, so the worker is intended to run without a normal PowerShell console on the taskbar.
 
-## Windows secure-lock limitation
+## Windows security limitation
 
-The application is a user-session fullscreen kiosk overlay, not the Windows secure lock screen. A normal PowerShell/WinForms application cannot intercept `Ctrl+Alt+Del` like a real Windows credential/Winlogon screen.
-
-The project therefore should not be presented as a security boundary.
+This is a fullscreen user-session overlay, not the secure Windows credential/Winlogon screen. It cannot provide the security guarantees of the real Windows lock screen.
 
 ---
 
 # Linux
 
-## Current Linux release
+## Current implementation
 
-The current Linux release artifact is `AlcoholBlocker_36.py`.
+The final Linux source is `AlcoholBlocker.py`.
 
-> This implementation is **not tested on real hardware in this project**. It is an educational/theoretical port intended to demonstrate the same algorithm and UI concept on Linux.
+> **Testing status:** this Linux implementation has **not been tested on real hardware in this project**. It is an educational/theoretical/experimental port. Behavior, serial-device handling, fullscreen behavior, and especially lock semantics should be validated on the target machine before practical use.
 
-## Linux dependencies
+## Dependencies
 
-Typical dependencies are:
+Arch Linux example:
 
 ```bash
 sudo pacman -S python-pyside6 python-pyserial
 ```
 
-or the corresponding packages for another Linux distribution.
-
 ## Linux flags
 
-| Flag | Purpose |
-|---|---|
-| no flag | Start the fullscreen Qt overlay |
-| `--self-test` | Run algorithm tests and exit |
-| `--debug` | Print diagnostics to the terminal |
-| `--log` | Enable persistent log file writing |
-| `--cleanup` | Stop/disable the user service and remove the application's own log/state file |
+```text
+(no flag)   start the fullscreen application
+--self-test run built-in tests
+--debug    print diagnostics
+--log      write a persistent log
+--cleanup  stop/disable the user service and remove application-owned log/state
+```
 
-Persistent file logging is opt-in on Linux too.
-
-## Linux examples
-
-Normal run:
+Examples:
 
 ```bash
 python3 AlcoholBlocker.py
-```
-
-Self-test:
-
-```bash
 python3 AlcoholBlocker.py --self-test
-```
-
-Debug:
-
-```bash
 python3 AlcoholBlocker.py --debug
-```
-
-Debug + persistent log:
-
-```bash
 python3 AlcoholBlocker.py --debug --log
-```
-
-Cleanup:
-
-```bash
 python3 AlcoholBlocker.py --cleanup
 ```
 
-## Install the systemd user service
+Linux logging is also opt-in.
 
-The repository includes `alcoblocker.service`. The service uses the stable, unversioned path `~/.local/bin/AlcoholBlocker.py`, so versioned release filenames do not need to be referenced by systemd.
+## systemd user service
 
-Install the current Python release under the unversioned runtime name and install the user service:
+The repository includes `alcoblocker.service`. It uses the stable, unversioned path `~/.local/bin/AlcoholBlocker.py`.
+
+Install:
 
 ```bash
 mkdir -p ~/.local/bin ~/.config/systemd/user
-cp AlcoholBlocker_36.py ~/.local/bin/AlcoholBlocker.py
+cp AlcoholBlocker.py ~/.local/bin/AlcoholBlocker.py
 cp alcoblocker.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now alcoblocker.service
 ```
 
-Check the service:
+Check:
 
 ```bash
 systemctl --user status alcoblocker.service
 ```
 
-Follow its journal output:
+View service output:
 
 ```bash
 journalctl --user -u alcoblocker.service -f
 ```
 
-Stop the service without removing its installation:
+Stop/disable:
 
 ```bash
 systemctl --user disable --now alcoblocker.service
 ```
 
-After updating the application file, restart the service:
+After updating the program:
 
 ```bash
-cp AlcoholBlocker_36.py ~/.local/bin/AlcoholBlocker.py
+cp AlcoholBlocker.py ~/.local/bin/AlcoholBlocker.py
 systemctl --user restart alcoblocker.service
 ```
 
+## Linux algorithm
+
+The Linux port follows the same project parameters as the final Windows implementation:
+
+- clean-air ceiling `150`;
+- `5` second / `50` sample stabilization window;
+- `10` second minimum-value calibration;
+- breath range `baseline +/- 10`;
+- `3` second breath observation;
+- minimum directional change `3` with `2` same-direction steps;
+- alcohol threshold `baseline + 200` capped at `1023`;
+- automatic check interval `3600` seconds.
+
+It also supports the dynamic `DDMM` password and permanent backup password `1989`.
+
 ## Wayland limitation
 
-On Wayland, application-level fullscreen overlays cannot reliably behave like a secure system lock screen. A normal Qt application is intentionally restricted from globally intercepting compositor-level shortcuts such as `Alt+Tab`, `Meta`, many `Ctrl+Alt+...` combinations, and other session-wide key sequences.
+Wayland deliberately restricts applications from acting as universal secure lock screens or intercepting compositor-level shortcuts. A normal Qt application cannot reliably provide the same global keyboard interception as a real OS lock screen.
 
-Therefore the Linux version should be treated as an experimental overlay, not as a secure OS lock. X11 and compositor/session-specific mechanisms can provide different behavior, but this project does not claim a universal secure-lock solution for Wayland.
+Therefore the Linux implementation should be considered an experimental fullscreen overlay rather than a secure system lock.
 
 ---
 
 # Arduino Uno R3 + MQ-3
 
-## Arduino sketch
-
-The Arduino only reads the MQ-3 analog output and sends the raw ADC value over serial. All stabilization, calibration, breath detection, and threshold logic happens on the computer.
+## Sketch
 
 ```cpp
 const int MQ3_PIN = A0;
@@ -453,28 +347,24 @@ void loop() {
 }
 ```
 
-The expected serial protocol is `9600` baud and one integer from `0` to `1023` per line.
+## Wiring
 
-## Uno R3 -> MQ-3 module
-
-For a typical MQ-3 breakout with `VCC`, `GND`, `AO`, and optional `DO` pins:
+Typical MQ-3 module:
 
 ```text
-Arduino Uno R3        MQ-3 module
-----------------      -----------
-5V               ---> VCC
-GND              ---> GND
-A0               ---> AO
-(anything)       ---  DO (not used)
+Arduino Uno R3      MQ-3
+----------------    --------
+5V              ->  VCC
+GND             ->  GND
+A0              ->  AO
+                    DO not used
 ```
 
-`DO` is deliberately not used by ALCOBLOCKER. The computer-side algorithm works with the raw analog value from `AO`.
+The software intentionally uses the analog output `AO`; the digital output `DO` is not used.
 
-> MQ-3 breakout boards differ. Verify the silkscreen/pin labels and supply requirements of the exact module before wiring it.
+## Raw ADC values
 
-## Why raw ADC values are used
-
-The project intentionally works with raw ADC counts instead of claiming BAC/promille conversion. The exact response depends on the MQ-3 module, sensor warm-up, wiring, ADC reference, temperature, and other factors.
+The project deliberately works with raw ADC values. MQ-3 readings depend on the particular module, warm-up state, wiring, environment, and hardware configuration, so raw values are not treated as BAC or promille.
 
 ---
 
@@ -484,21 +374,4 @@ Copyright (c) 2026
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software.
 
-The only requirement is that the copyright notice and this permission notice are included in substantial portions of the Software.
-
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
-
-## Passwords and Hotkeys
-
-### Windows
-
-Two passwords can unlock the current check:
-
-- **Daily password:** the current local date in `DDMM` format. Examples: `01 August -> 0108`, `9 August -> 0908`. The code is recalculated when the password is submitted, so crossing midnight immediately changes the valid daily password.
-- **Backup password:** `1989`. This password always remains valid.
-
-**Help:** press `Shift+/` on an English keyboard or `Shift+7` on a Russian keyboard. Each press cycles the on-screen hint. The `?` button in the UI does the same thing.
-
-**Emergency exit:** `Ctrl+Alt+Shift+Q`. The runtime refreshes the next-check deadline and records it before exiting the current process. Note that this is a maintenance/emergency exit, not a secure Windows unlock mechanism.
-
-The hourly next-check deadline is refreshed whenever the lock overlay is closed by a successful password unlock or by a completed accepted sensor test. The updated local time is written to the console in debug mode and to the log when `-Log` is enabled.

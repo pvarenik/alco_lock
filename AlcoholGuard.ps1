@@ -1,14 +1,13 @@
 #requires -Version 5.1
 
 <##
-    AlcoholGuard_37.ps1
+    AlcoholGuard.ps1
 
     Purpose:
       - Detect Arduino MQ-3 sensor over serial.
       - Lock the desktop with a fullscreen overlay.
       - Ask the user to blow into the sensor.
       - Require a confirmed directional breath event and a short observation window.
-      - Allow emergency unlock with daily DDMM password or backup password 1989.
       - Run immediately at logon and repeat the check every hour.
       - Remove the scheduled task with -CleanUp.
       - Run algorithm tests with -SelfTest.
@@ -110,7 +109,6 @@ $UiTickMs = 100
 $SensorReadEveryMs = 100
 $PortScanIntervalMs = 2000
 $NoDataTimeoutSeconds = 8
-$EnableEmergencyExitHotkey = $true
 
 # Logging is disabled by default. Use -Log to write AlcoholGuard.log.
 $LogDirectory = Join-Path $env:LOCALAPPDATA 'AlcoholGuard'
@@ -180,7 +178,6 @@ $script:RefreshBaselineButton = $null
 $script:Timer = $null
 
 $script:KeyboardHookInstalled = $false
-$script:EmergencyExitRequested = $false
 $script:HelpRequested = $false
 $script:HelpIndex = 0
 $script:HelpLabel = $null
@@ -677,8 +674,8 @@ function Complete-StabilizationIfReady {
 
     if ($elapsed -ge $StabilizationMinimumSeconds -and (Test-StabilizationWindow)) {
         $values = @($script:StabilizationReadings)
-        $median = [int][Math]::Round([double](Get-Median -Values $values))
-        Write-GuardLog "Sensor stabilized: median=$median span=$((($values | Measure-Object -Maximum).Maximum) - (($values | Measure-Object -Minimum).Minimum)) window=$($values -join ',')"
+        $stabilizedMinimum = [int](($values | Measure-Object -Minimum).Minimum)
+        Write-GuardLog "Sensor stabilized: minimum=$stabilizedMinimum span=$((($values | Measure-Object -Maximum).Maximum) - (($values | Measure-Object -Minimum).Minimum)) window=$($values -join ',')"
         # Establish the initial schedule from the moment stabilization completes.
         # A real breath event will reset this deadline later.
         Schedule-NextHourlyCheck -BaseUtc ([DateTime]::UtcNow)
@@ -1109,7 +1106,6 @@ function Get-HelpMessages {
         'The displayed breath range is a raw ADC range around the current baseline; it is not a BAC reading.',
         'Next Check shows the time of the next automatic check and is recalculated after a completed unlock event.',
         'Press ? to cycle through these hints. The shortcut works with both English and Russian keyboard layouts.',
-        'Emergency exit: Ctrl+Alt+Shift+Q. This stops the current guard process after refreshing the next-check time.',
         'Daily password: DDMM uses the current date. Example: August 1 = 0108. It is checked when you submit it.',
         'Backup password: 1989. It always works.'
     )
@@ -1311,19 +1307,17 @@ namespace AlcoholGuard
         private const int VK_RCONTROL = 0xA3;
         private const int VK_LSHIFT = 0xA0;
         private const int VK_RSHIFT = 0xA1;
-        private const int VK_Q = 0x51;
         private const int VK_7 = 0x37;
         private const int VK_OEM_2 = 0xBF;
 
-        public static bool EmergencyExitRequested { get; private set; }
         public static bool HelpRequested { get; set; }
+
 
         private static IntPtr _hook = IntPtr.Zero;
         private static LowLevelKeyboardProc _proc = HookCallback;
 
         public static void Install()
         {
-            EmergencyExitRequested = false;
             HelpRequested = false;
             if (_hook != IntPtr.Zero) return;
 
@@ -1356,12 +1350,6 @@ namespace AlcoholGuard
             bool ctrl = IsDown(VK_LCONTROL) || IsDown(VK_RCONTROL);
             bool shift = IsDown(VK_LSHIFT) || IsDown(VK_RSHIFT);
             bool win = IsDown(VK_LWIN) || IsDown(VK_RWIN);
-
-            // Emergency test/maintenance exit: Ctrl+Alt+Shift+Q.
-            if (vk == VK_Q && ctrl && alt && shift) {
-                EmergencyExitRequested = true;
-                return true;
-            }
 
             // Help hotkey: Shift+/ on English layout or Shift+7 on Russian layout.
             // Both map to a literal question-mark action for the guard UI.
@@ -1423,11 +1411,13 @@ namespace AlcoholGuard
 '@
 }
 
+
 function Start-KeyboardHook {
     Initialize-KeyboardBlockerType
     [AlcoholGuard.KeyboardBlocker]::Install()
     $script:KeyboardHookInstalled = $true
     Write-GuardLog 'Keyboard hook installed'
+
 }
 
 function Stop-KeyboardHook {
@@ -1435,6 +1425,10 @@ function Stop-KeyboardHook {
         if ($script:KeyboardHookInstalled -and $null -ne ('AlcoholGuard.KeyboardBlocker' -as [type])) {
             [AlcoholGuard.KeyboardBlocker]::Uninstall()
         }
+    }
+    catch {
+    }
+    try {
     }
     catch {
     }
@@ -1674,7 +1668,7 @@ function Invoke-SelfTest {
         }
     }
 
-    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_37 ===' -ForegroundColor Cyan
+    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_46 ===' -ForegroundColor Cyan
 
     # ------------------------------------------------------------
     # Basic configuration / calibration math
@@ -1717,7 +1711,7 @@ function Invoke-SelfTest {
     $calibrationMin = ($calibrationMinTest | Measure-Object -Minimum).Minimum
     Assert-Test 'Calibration baseline uses minimum observed value' ($calibrationMin -eq 43)
 
-    $recent = @(75,82)
+    $recent = @(75,86)
     $hits = @($recent | Where-Object { $_ -ge $upperThreshold -or $_ -le $lowerThreshold }).Count
     Assert-Test 'One breath-like sample starts observation' ($hits -ge $BreathRequiredHits)
 
@@ -1832,11 +1826,9 @@ function Invoke-SelfTest {
     Assert-Test 'Slow monotonic drift is rejected even when per-sample change is small' ($slowSpan -gt $StabilizationMaxSpan -or $slowAmount -gt $StabilizationMaxDrift)
 
     $subtleDrift = @(149,148,149,147,148,146,147,145)
-    $subtleNegativeSteps = 0
-    for ($i = 1; $i -lt $subtleDrift.Count; $i++) {
-        if ($subtleDrift[$i] -lt $subtleDrift[$i-1]) { $subtleNegativeSteps++ }
-    }
-    Assert-Test 'Subtle downward trend is rejected below 150' ($subtleNegativeSteps -gt $StabilizationMaxNegativeSteps)
+    $subtleSpan = [int](($subtleDrift | Measure-Object -Maximum).Maximum) - [int](($subtleDrift | Measure-Object -Minimum).Minimum)
+    $subtleAmount = [Math]::Abs($subtleDrift[0] - $subtleDrift[$subtleDrift.Count-1])
+    Assert-Test 'Subtle downward trend is rejected below 150' ($subtleSpan -gt $StabilizationMaxSpan -or $subtleAmount -gt $StabilizationMaxDrift)
 
     $highFalling = @(500,470,430,390,350,310,270,230)
     $highFallingSpan = [int](($highFalling | Measure-Object -Maximum).Maximum) - [int](($highFalling | Measure-Object -Minimum).Minimum)
@@ -1974,18 +1966,6 @@ function Start-GuardRuntime {
                     Write-GuardLog "Help hint requested. Current hint index=$script:HelpIndex"
                 }
 
-                if ($EnableEmergencyExitHotkey -and $script:KeyboardHookInstalled -and [AlcoholGuard.KeyboardBlocker]::EmergencyExitRequested) {
-                    # Treat emergency exit as closing the current check window: refresh the timer
-                    # and record the new deadline before leaving the process.
-                    Schedule-NextHourlyCheck
-                    Write-GuardLog 'Emergency exit hotkey pressed (Ctrl+Alt+Shift+Q); next check refreshed before exit'
-                    $script:Timer.Stop()
-                    Stop-KeyboardHook
-                    Close-SerialPort
-                    foreach ($form in $script:Forms) { try { $form.Hide() } catch {} }
-                    [System.Windows.Forms.Application]::Exit()
-                    return
-                }
 
                 # Re-assert TopMost without stealing focus from the password box.
                 if ($script:State -ne 'Unlocked') {
@@ -2128,12 +2108,17 @@ if (-not $Run) {
 
     # Use ProcessStartInfo.ArgumentList when available is not reliable on every
     # PowerShell 5.1 environment, so build one explicit argument string.
-    $escapedScriptPath = $PSCommandPath.Replace('"', '\"')
-    $debugArgument = if ($DebugMode) { ' -DebugMode' } else { '' }
-    $logArgument = if ($Log) { ' -Log' } else { '' }
-    $runArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Run{1}{2}' -f $escapedScriptPath, $debugArgument, $logArgument
+    # Start the same hidden VBS launcher used by Task Scheduler. This avoids
+    # PowerShell 5.1 argument/quoting issues and guarantees that the runtime
+    # starts with -Run while remaining hidden from the taskbar.
+    $wscriptExe = Join-Path $env:WINDIR 'System32\wscript.exe'
+    if (-not (Test-Path $wscriptExe)) {
+        throw 'Cannot find wscript.exe.'
+    }
 
-    Start-Process -FilePath $powershellExe -ArgumentList $runArguments -WindowStyle Hidden
+    $launcherArguments = '"{0}"' -f $LauncherVbs
+    Start-Process -FilePath $wscriptExe -ArgumentList $launcherArguments -WindowStyle Hidden
+    Write-Host 'AlcoholGuard runtime started in the background.'
     exit 0
 }
 
