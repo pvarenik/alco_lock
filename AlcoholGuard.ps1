@@ -1,13 +1,14 @@
 #requires -Version 5.1
 
 <##
-    AlcoholGuard.ps1
+    AlcoholGuard_48.ps1
 
     Purpose:
       - Detect Arduino MQ-3 sensor over serial.
       - Lock the desktop with a fullscreen overlay.
       - Ask the user to blow into the sensor.
       - Require a confirmed directional breath event and a short observation window.
+      - Allow emergency unlock with daily DDMM password or backup password 1989.
       - Run immediately at logon and repeat the check every hour.
       - Remove the scheduled task with -CleanUp.
       - Run algorithm tests with -SelfTest.
@@ -346,6 +347,12 @@ $script:BreathObservationDirection = $null
 }
 
 function Close-SerialPort {
+    param(
+        [switch]$PreserveAlcoholLock
+    )
+
+    $wasAlcoholDetected = ($script:State -eq 'AlcoholDetected')
+
     try {
         if ($null -ne $script:SerialPort) {
             if ($script:SerialPort.IsOpen) {
@@ -363,8 +370,16 @@ function Close-SerialPort {
     $script:SensorConnected = $false
     $script:SerialBuffer = ''
     $script:LastValidSensorReadUtc = $null
-    Clear-SensorAlgorithmState
-    Set-State -NewState 'NoSensor'
+
+    if ($PreserveAlcoholLock -and $wasAlcoholDetected) {
+        # Preserve the alcohol result and its next-check deadline across a
+        # temporary sensor disconnect. Reconnection must not start calibration.
+        Set-State -NewState 'AlcoholDetected'
+    }
+    else {
+        Clear-SensorAlgorithmState
+        Set-State -NewState 'NoSensor'
+    }
 }
 
 function Test-NumericSensorLine {
@@ -559,6 +574,10 @@ function Find-Arduino {
             $script:SerialBuffer = ''
             $script:LastValidSensorReadUtc = [DateTime]::UtcNow
             Write-GuardLog "Serial port opened: $($candidate.PortName) | $($candidate.FriendlyName)"
+            if ($script:State -eq 'AlcoholDetected') {
+                Write-GuardLog 'Sensor reconnected while AlcoholDetected; preserving lock and skipping calibration'
+                return $true
+            }
             Start-Stabilization | Out-Null
             return $true
         }
@@ -675,8 +694,8 @@ function Complete-StabilizationIfReady {
 
     if ($elapsed -ge $StabilizationMinimumSeconds -and (Test-StabilizationWindow)) {
         $values = @($script:StabilizationReadings)
-        $stabilizedMinimum = [int](($values | Measure-Object -Minimum).Minimum)
-        Write-GuardLog "Sensor stabilized: minimum=$stabilizedMinimum span=$((($values | Measure-Object -Maximum).Maximum) - (($values | Measure-Object -Minimum).Minimum)) window=$($values -join ',')"
+        $median = [int][Math]::Round([double](Get-Median -Values $values))
+        Write-GuardLog "Sensor stabilized: median=$median span=$((($values | Measure-Object -Maximum).Maximum) - (($values | Measure-Object -Minimum).Minimum)) window=$($values -join ',')"
         # Establish the initial schedule from the moment stabilization completes.
         # A real breath event will reset this deadline later.
         Schedule-NextHourlyCheck -BaseUtc ([DateTime]::UtcNow)
@@ -1109,7 +1128,7 @@ function Get-HelpMessages {
         'Press ? to cycle through these hints. The shortcut works with both English and Russian keyboard layouts.',
         'Daily password: DDMM uses the current date. Example: August 1 = 0108. It is checked when you submit it.',
         'Backup password: 1989. It always works.',
-        'Cleanup password: cleanup. It starts the -CleanUp path, removes the scheduled task and application-owned artifacts, and terminates the current guard.'
+        'Cleanup password: cleanup. It removes the task/artifacts and exits the application.'
     )
 }
 
@@ -1248,6 +1267,21 @@ function Get-DailyPassword {
     return (Get-Date -Format 'ddMM')
 }
 
+function Invoke-InteractiveCleanup {
+    Write-GuardLog 'Cleanup password accepted; starting cleanup'
+
+    try { if ($null -ne $script:Timer) { $script:Timer.Stop() } } catch {}
+    Stop-KeyboardHook
+    Close-SerialPort
+    Hide-LockOverlay
+
+    Remove-GuardTask
+    Remove-GuardArtifacts
+
+    Write-Host 'AlcoholGuard cleanup complete.'
+    exit 0
+}
+
 function Unlock-WithPassword {
     if ($null -eq $script:PasswordBox) {
         return
@@ -1258,23 +1292,8 @@ function Unlock-WithPassword {
 
     if ($entered -eq $CleanupPassword) {
         $script:PasswordBox.Clear()
-        Write-GuardLog 'Cleanup password accepted; starting -CleanUp process'
-
-        $powershellExe = Join-Path $PSHome 'powershell.exe'
-        if (-not (Test-Path $powershellExe)) {
-            $powershellExe = (Get-Command powershell.exe).Source
-        }
-        $escapedScriptPath = $PSCommandPath.Replace('"', '\"')
-        $cleanupArgs = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -CleanUp' -f $escapedScriptPath
-        Start-Process -FilePath $powershellExe -ArgumentList $cleanupArgs -WindowStyle Hidden
-        Start-Sleep -Milliseconds 350
-        try {
-            Stop-KeyboardHook
-            Close-SerialPort
-            if ($null -ne $script:Timer) { $script:Timer.Stop() }
-            foreach ($form in $script:Forms) { try { $form.Hide() } catch {} }
-        } catch {}
-        exit 0
+        Invoke-InteractiveCleanup
+        return
     }
 
     if ($entered -eq $MasterPassword) {
@@ -1691,7 +1710,7 @@ function Invoke-SelfTest {
         }
     }
 
-    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_47 ===' -ForegroundColor Cyan
+    Write-Host '=== AlcoholGuard SelfTest AlcoholGuard_37 ===' -ForegroundColor Cyan
 
     # ------------------------------------------------------------
     # Basic configuration / calibration math
@@ -1734,7 +1753,7 @@ function Invoke-SelfTest {
     $calibrationMin = ($calibrationMinTest | Measure-Object -Minimum).Minimum
     Assert-Test 'Calibration baseline uses minimum observed value' ($calibrationMin -eq 43)
 
-    $recent = @(75,86)
+    $recent = @(75,82)
     $hits = @($recent | Where-Object { $_ -ge $upperThreshold -or $_ -le $lowerThreshold }).Count
     Assert-Test 'One breath-like sample starts observation' ($hits -ge $BreathRequiredHits)
 
@@ -1849,9 +1868,11 @@ function Invoke-SelfTest {
     Assert-Test 'Slow monotonic drift is rejected even when per-sample change is small' ($slowSpan -gt $StabilizationMaxSpan -or $slowAmount -gt $StabilizationMaxDrift)
 
     $subtleDrift = @(149,148,149,147,148,146,147,145)
-    $subtleSpan = [int](($subtleDrift | Measure-Object -Maximum).Maximum) - [int](($subtleDrift | Measure-Object -Minimum).Minimum)
-    $subtleAmount = [Math]::Abs($subtleDrift[0] - $subtleDrift[$subtleDrift.Count-1])
-    Assert-Test 'Subtle downward trend is rejected below 150' ($subtleSpan -gt $StabilizationMaxSpan -or $subtleAmount -gt $StabilizationMaxDrift)
+    $subtleNegativeSteps = 0
+    for ($i = 1; $i -lt $subtleDrift.Count; $i++) {
+        if ($subtleDrift[$i] -lt $subtleDrift[$i-1]) { $subtleNegativeSteps++ }
+    }
+    Assert-Test 'Subtle downward trend is rejected below 150' ($subtleNegativeSteps -gt $StabilizationMaxNegativeSteps)
 
     $highFalling = @(500,470,430,390,350,310,270,230)
     $highFallingSpan = [int](($highFalling | Measure-Object -Maximum).Maximum) - [int](($highFalling | Measure-Object -Minimum).Minimum)
@@ -2040,7 +2061,7 @@ function Start-GuardRuntime {
                         $noDataSeconds = ([DateTime]::UtcNow - $script:LastValidSensorReadUtc).TotalSeconds
                         if ($noDataSeconds -ge $NoDataTimeoutSeconds) {
                             Write-GuardLog "No valid sensor data for $([Math]::Round($noDataSeconds,1))s during active check; reconnecting"
-                            Close-SerialPort
+                            if ($script:State -eq 'AlcoholDetected') { Close-SerialPort -PreserveAlcoholLock } else { Close-SerialPort }
                             $script:LastScanUtc = [DateTime]::UtcNow.AddMilliseconds(-$PortScanIntervalMs)
                         }
                     }
@@ -2048,7 +2069,7 @@ function Start-GuardRuntime {
                     # If sensor disappeared, reconnect on the next scan.
                     if ($script:SensorConnected -and ($null -eq $script:SerialPort -or -not $script:SerialPort.IsOpen)) {
                         Write-GuardLog 'Sensor disconnected during active check'
-                        Close-SerialPort
+                        if ($script:State -eq 'AlcoholDetected') { Close-SerialPort -PreserveAlcoholLock } else { Close-SerialPort }
                     }
                 }
 
